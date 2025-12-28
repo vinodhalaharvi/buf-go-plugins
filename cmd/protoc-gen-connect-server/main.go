@@ -241,11 +241,21 @@ func genList(m MethodInfo) Code {
 		}
 	}
 
+	// Handle Empty input (no pagination) vs normal request with GetLimit
+	var limitCode Code
+	if m.InputType == "emptypb.Empty" {
+		limitCode = line("limit := 100")
+	} else {
+		limitCode = concat(
+			line("limit := int(req.Msg.GetLimit())"),
+			line("if limit <= 0 || limit > 100 {"),
+			line("	limit = 100"),
+			line("}"),
+		)
+	}
+
 	return concat(
-		line("limit := int(req.Msg.GetLimit())"),
-		line("if limit <= 0 || limit > 100 {"),
-		line("	limit = 100"),
-		line("}"),
+		limitCode,
 		blank(),
 		linef("entities, err := s.%sRepo.List(ctx, limit)", e),
 		line("if err != nil {"),
