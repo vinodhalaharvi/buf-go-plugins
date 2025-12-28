@@ -16,6 +16,7 @@ import (
 	"unicode"
 
 	"google.golang.org/protobuf/compiler/protogen"
+	pluginpb "google.golang.org/protobuf/types/pluginpb"
 )
 
 // =============================================================================
@@ -609,6 +610,7 @@ func GenerateServiceLogicInterface(serviceName string, directives []LLMDirective
 
 func main() {
 	protogen.Options{}.Run(func(gen *protogen.Plugin) error {
+		gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
 		apiKey := os.Getenv("ANTHROPIC_API_KEY")
 
 		for _, f := range gen.Files {

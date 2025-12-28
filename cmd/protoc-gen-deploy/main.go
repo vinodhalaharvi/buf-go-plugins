@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"google.golang.org/protobuf/compiler/protogen"
+	pluginpb "google.golang.org/protobuf/types/pluginpb"
 )
 
 // =============================================================================
@@ -499,6 +500,7 @@ func toSnakeCase(s string) string {
 
 func main() {
 	protogen.Options{}.Run(func(gen *protogen.Plugin) error {
+		gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
 		// Track if we've generated deployment files
 		generated := false
 

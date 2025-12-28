@@ -10,6 +10,7 @@ import (
 
 	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	pluginpb "google.golang.org/protobuf/types/pluginpb"
 )
 
 // =============================================================================
@@ -692,6 +693,7 @@ func GenerateFile(file *protogen.File) Code {
 
 func main() {
 	protogen.Options{}.Run(func(gen *protogen.Plugin) error {
+		gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
 		for _, f := range gen.Files {
 			if !f.Generate || len(f.Services) == 0 {
 				continue

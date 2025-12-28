@@ -9,6 +9,7 @@ import (
 	"unicode"
 
 	"google.golang.org/protobuf/compiler/protogen"
+	pluginpb "google.golang.org/protobuf/types/pluginpb"
 )
 
 // =============================================================================
@@ -371,6 +372,7 @@ func generateWireInjectorsExample(entities []MessageInfo, pkgName string) Code {
 
 func main() {
 	protogen.Options{}.Run(func(gen *protogen.Plugin) error {
+		gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
 		for _, f := range gen.Files {
 			if !f.Generate || len(f.Messages) == 0 {
 				continue

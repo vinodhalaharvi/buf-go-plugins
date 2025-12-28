@@ -9,6 +9,7 @@ import (
 
 	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	pluginpb "google.golang.org/protobuf/types/pluginpb"
 )
 
 // =============================================================================
@@ -798,6 +799,7 @@ func GenerateErrorsFile(pkgName string) Code {
 
 func main() {
 	protogen.Options{}.Run(func(gen *protogen.Plugin) error {
+		gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
 		errorsGenerated := false
 		for _, f := range gen.Files {
 			if !f.Generate || len(f.Messages) == 0 {
