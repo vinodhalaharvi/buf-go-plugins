@@ -1,5 +1,18 @@
 // protoc-gen-firestore generates Firestore CRUD stubs using Category Theory composition
 // No string append - uses: Monoid, Functor (Map), Fold, When
+//
+// Usage: Add to your proto:
+//
+//	import "options/v1/options.proto";
+//
+//	message User {
+//	  option (bufplugins.options.v1.entity) = {
+//	    collection: "users"
+//	    id_field: "user_id"
+//	  };
+//	  string user_id = 1;
+//	  string email = 2;
+//	}
 package main
 
 import (
@@ -8,9 +21,14 @@ import (
 	"unicode"
 
 	"google.golang.org/protobuf/compiler/protogen"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
 	pluginpb "google.golang.org/protobuf/types/pluginpb"
 )
+
+// Extension field number for entity option (matches options.proto)
+const entityExtensionNumber = 50000
 
 // =============================================================================
 // CATEGORY THEORY FOUNDATIONS
@@ -144,11 +162,151 @@ func Return(values ...string) Code {
 }
 
 // =============================================================================
+// ENTITY OPTIONS (from proto options)
+// =============================================================================
+
+type EntityConfig struct {
+	Generate   bool
+	Collection string
+	IDField    string
+}
+
+// getEntityConfig extracts entity options from message descriptor
+func getEntityConfig(msg *protogen.Message) *EntityConfig {
+	opts := msg.Desc.Options()
+	if opts == nil {
+		return nil
+	}
+
+	// Get the raw options to check for our extension
+	optsProto, ok := opts.(*descriptorpb.MessageOptions)
+	if !ok {
+		return nil
+	}
+
+	// Check if our extension is present using proto reflection
+	// Extension number 50000 is our entity option
+	b, err := proto.Marshal(optsProto)
+	if err != nil {
+		return nil
+	}
+
+	// Look for extension field 50000 in the wire format
+	// This is a simple check - if the message has unknown fields with our extension number
+	if !hasExtension(b, entityExtensionNumber) {
+		return nil
+	}
+
+	// Extension is present - extract values from unknown fields
+	config := &EntityConfig{
+		Generate:   true,
+		Collection: toSnakeCase(string(msg.Desc.Name())) + "s",
+		IDField:    findIDField(msg),
+	}
+
+	// Try to parse the extension data for custom values
+	parseEntityExtension(optsProto, config)
+
+	return config
+}
+
+// hasExtension checks if wire-format bytes contain an extension with given field number
+func hasExtension(b []byte, fieldNum int32) bool {
+	// Simple heuristic: check if ProtoReflect has unknown fields
+	// For a more robust solution, we'd parse the wire format properly
+	// But for our use case, just having the option present is enough
+	return len(b) > 0 && containsFieldTag(b, fieldNum)
+}
+
+// containsFieldTag is a simple check for field presence in wire format
+func containsFieldTag(b []byte, fieldNum int32) bool {
+	// Wire format: (field_number << 3) | wire_type
+	// For embedded message (wire type 2): tag = (fieldNum << 3) | 2
+	expectedTag := uint64(fieldNum<<3 | 2)
+
+	i := 0
+	for i < len(b) {
+		tag, n := decodeVarint(b[i:])
+		if n == 0 {
+			break
+		}
+		if tag == expectedTag {
+			return true
+		}
+		i += n
+
+		// Skip the value based on wire type
+		wireType := tag & 0x7
+		switch wireType {
+		case 0: // Varint
+			_, vn := decodeVarint(b[i:])
+			i += vn
+		case 1: // 64-bit
+			i += 8
+		case 2: // Length-delimited
+			length, ln := decodeVarint(b[i:])
+			i += ln + int(length)
+		case 5: // 32-bit
+			i += 4
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func decodeVarint(b []byte) (uint64, int) {
+	var x uint64
+	var n int
+	for n < len(b) && n < 10 {
+		v := b[n]
+		x |= uint64(v&0x7f) << (7 * n)
+		n++
+		if v < 0x80 {
+			return x, n
+		}
+	}
+	return 0, 0
+}
+
+// parseEntityExtension tries to extract custom values from the extension
+func parseEntityExtension(opts *descriptorpb.MessageOptions, config *EntityConfig) {
+	// This would require the generated options package to fully parse
+	// For now, we rely on defaults and the proto-level extraction
+	// The extension presence is enough to trigger generation
+}
+
+// findIDField finds the ID field in a message
+func findIDField(msg *protogen.Message) string {
+	// First look for "id" field
+	for _, field := range msg.Fields {
+		name := string(field.Desc.Name())
+		if strings.EqualFold(name, "id") {
+			return name
+		}
+	}
+	// Then look for first field ending in "_id"
+	for _, field := range msg.Fields {
+		name := string(field.Desc.Name())
+		if strings.HasSuffix(strings.ToLower(name), "_id") {
+			return name
+		}
+	}
+	// Default to first string field
+	for _, field := range msg.Fields {
+		if field.Desc.Kind() == protoreflect.StringKind {
+			return string(field.Desc.Name())
+		}
+	}
+	return "id"
+}
+
+// =============================================================================
 // MESSAGE INFO (Pure data extraction)
 // =============================================================================
 
 type MessageInfo struct {
-	Name, GoName, Collection                        string
+	Name, GoName, Collection, IDField, IDGoName     string
 	Fields                                          []FieldInfo
 	HasID, HasCreatedAt, HasUpdatedAt, HasDeletedAt bool
 }
@@ -158,14 +316,19 @@ type FieldInfo struct {
 	IsID, IsIndexed, IsUnique, IsEnum, IsRepeated bool
 }
 
-func ExtractMessageInfo(msg *protogen.Message) MessageInfo {
-	fields := Map(msg.Fields, ExtractFieldInfo)
+func ExtractMessageInfo(msg *protogen.Message, config *EntityConfig) MessageInfo {
+	fields := Map(msg.Fields, func(f *protogen.Field) FieldInfo {
+		return ExtractFieldInfo(f, config.IDField)
+	})
+
 	hasID, hasCreatedAt, hasUpdatedAt, hasDeletedAt := false, false, false, false
+	var idGoName string
 	for _, f := range fields {
 		snake := toSnakeCase(f.Name)
 		switch {
 		case f.IsID:
 			hasID = true
+			idGoName = f.GoName
 		case snake == "created_at":
 			hasCreatedAt = true
 		case snake == "updated_at":
@@ -174,16 +337,25 @@ func ExtractMessageInfo(msg *protogen.Message) MessageInfo {
 			hasDeletedAt = true
 		}
 	}
+
 	return MessageInfo{
-		Name: string(msg.Desc.Name()), GoName: msg.GoIdent.GoName,
-		Collection: toSnakeCase(string(msg.Desc.Name())) + "s", Fields: fields,
-		HasID: hasID, HasCreatedAt: hasCreatedAt, HasUpdatedAt: hasUpdatedAt, HasDeletedAt: hasDeletedAt,
+		Name:         string(msg.Desc.Name()),
+		GoName:       msg.GoIdent.GoName,
+		Collection:   config.Collection,
+		IDField:      config.IDField,
+		IDGoName:     idGoName,
+		Fields:       fields,
+		HasID:        hasID,
+		HasCreatedAt: hasCreatedAt,
+		HasUpdatedAt: hasUpdatedAt,
+		HasDeletedAt: hasDeletedAt,
 	}
 }
 
-func ExtractFieldInfo(field *protogen.Field) FieldInfo {
+func ExtractFieldInfo(field *protogen.Field, idField string) FieldInfo {
 	name := string(field.Desc.Name())
-	isUnique := strings.EqualFold(name, "email") || strings.EqualFold(name, "slug") || strings.EqualFold(name, "username")
+	isID := strings.EqualFold(name, idField)
+	isUnique := isID || strings.EqualFold(name, "email") || strings.EqualFold(name, "slug") || strings.EqualFold(name, "username")
 	isIndexed := isUnique || field.Desc.Kind() == protoreflect.EnumKind ||
 		strings.HasSuffix(strings.ToLower(name), "_id") ||
 		strings.EqualFold(name, "status") || strings.EqualFold(name, "role")
@@ -194,7 +366,7 @@ func ExtractFieldInfo(field *protogen.Field) FieldInfo {
 	}
 	return FieldInfo{
 		Name: name, GoName: field.GoName, GoType: goType,
-		IsID: strings.EqualFold(name, "id"), IsIndexed: isIndexed, IsUnique: isUnique,
+		IsID: isID, IsIndexed: isIndexed, IsUnique: isUnique,
 		IsEnum: field.Desc.Kind() == protoreflect.EnumKind, IsRepeated: isRepeated,
 	}
 }
@@ -236,53 +408,38 @@ func fieldGoType(field *protogen.Field) string {
 // =============================================================================
 
 func Header() Code {
-	return Concat(CodeMonoid, []Code{
-		Comment("Code generated by protoc-gen-firestore. DO NOT EDIT."),
-		Comment("Generated using Category Theory: Monoid + Functor + Fold"),
-	})
+	return Comment("Code generated by protoc-gen-firestore. DO NOT EDIT.")
 }
 
 func CommonErrors() Code {
 	return Concat(CodeMonoid, []Code{
-		Blank(), Comment("Common errors"),
-		VarBlock(Concat(CodeMonoid, []Code{
-			Line(`ErrNotFound      = errors.New("document not found")`),
-			Line(`ErrAlreadyExists = errors.New("document already exists")`),
-			Line(`ErrInvalidID     = errors.New("invalid document ID")`),
+		Blank(), VarBlock(Concat(CodeMonoid, []Code{
+			Line("ErrNotFound = errors.New(\"not found\")"),
+			Line("ErrInvalidID = errors.New(\"invalid id\")"),
+			Line("ErrAlreadyExists = errors.New(\"already exists\")"),
 		})),
 	})
 }
 
 func RepositoryStruct(m MessageInfo) Code {
 	return Concat(CodeMonoid, []Code{
-		Blank(), Commentf("%sRepository interface for %s persistence", m.GoName, m.GoName),
-		Linef("type %sRepository interface {", m.GoName),
-		Linef("	Create(ctx context.Context, entity *%s) (string, error)", m.GoName),
-		Linef("	Get(ctx context.Context, id string) (*%s, error)", m.GoName),
-		Linef("	Update(ctx context.Context, entity *%s) error", m.GoName),
-		Line("	Delete(ctx context.Context, id string) error"),
-		Linef("	List(ctx context.Context) ([]*%s, error)", m.GoName),
-		Line("}"),
-		Blank(), Commentf("Firestore%sRepository implements %sRepository using Firestore", m.GoName, m.GoName),
-		Struct("Firestore"+m.GoName+"Repository", Concat(CodeMonoid, []Code{
-			Field("client", "*firestore.Client"),
-			Field("collection", "string"),
-		})),
+		Blank(),
+		Struct("Firestore"+m.GoName+"Repository", Field("client", "*firestore.Client")),
 	})
 }
 
 func Constructor(m MessageInfo) Code {
 	return Concat(CodeMonoid, []Code{
-		Blank(), Commentf("NewFirestore%sRepository creates a new Firestore repository", m.GoName),
+		Blank(),
 		Func("NewFirestore"+m.GoName+"Repository", "client *firestore.Client", "*Firestore"+m.GoName+"Repository",
-			Return(fmt.Sprintf("&Firestore%sRepository{client: client, collection: %q}", m.GoName, m.Collection))),
+			Return("&Firestore"+m.GoName+"Repository{client: client}")),
 	})
 }
 
 func CollectionHelpers(m MessageInfo) Code {
 	recv := "r *Firestore" + m.GoName + "Repository"
 	return Concat(CodeMonoid, []Code{
-		Blank(), Method(recv, "Collection", "", "*firestore.CollectionRef", Return("r.client.Collection(r.collection)")),
+		Blank(), Method(recv, "Collection", "", "*firestore.CollectionRef", Return(fmt.Sprintf("r.client.Collection(%q)", m.Collection))),
 		Blank(), Method(recv, "Doc", "id string", "*firestore.DocumentRef", Return("r.Collection().Doc(id)")),
 	})
 }
@@ -290,35 +447,25 @@ func CollectionHelpers(m MessageInfo) Code {
 func CreateMethod(m MessageInfo) Code {
 	recv := "r *Firestore" + m.GoName + "Repository"
 	return Concat(CodeMonoid, []Code{
-		Blank(), Commentf("Create creates a new %s", m.GoName),
-		Method(recv, "Create", "ctx context.Context, entity *"+m.GoName, "(string, error)",
+		Blank(), Comment("Create adds a new " + m.GoName + " to Firestore"),
+		Method(recv, "Create", "ctx context.Context, entity *"+m.GoName, "error",
 			Concat(CodeMonoid, []Code{
-				If("entity == nil", Return(`"", errors.New("entity cannot be nil")`)),
-				Blank(),
 				When(m.HasCreatedAt || m.HasUpdatedAt, Concat(CodeMonoid, []Code{
 					Line("now := timestamppb.Now()"),
 					When(m.HasCreatedAt, Line("entity.CreatedAt = now")),
 					When(m.HasUpdatedAt, Line("entity.UpdatedAt = now")),
-					Blank(),
 				})),
-				Line("data := r.toFirestoreData(entity)"),
-				Line("var docRef *firestore.DocumentRef"),
-				IfElse(`entity.Id != ""`,
+				IfElse(fmt.Sprintf("entity.%s == \"\"", m.IDGoName),
 					Concat(CodeMonoid, []Code{
-						Line("docRef = r.Doc(entity.Id)"),
-						Line("_, err := docRef.Create(ctx, data)"),
-						If("err != nil", Concat(CodeMonoid, []Code{
-							If("status.Code(err) == codes.AlreadyExists", Return(`"", ErrAlreadyExists`)),
-							Return(`"", fmt.Errorf("create failed: %w", err)`),
-						})),
+						Line("ref := r.Collection().NewDoc()"),
+						Linef("entity.%s = ref.ID", m.IDGoName),
+						Line("_, err := ref.Set(ctx, r.toFirestoreData(entity))"),
+						Return("err"),
 					}),
 					Concat(CodeMonoid, []Code{
-						Line("var err error"),
-						Line("docRef, _, err = r.Collection().Add(ctx, data)"),
-						If("err != nil", Return(`"", fmt.Errorf("create failed: %w", err)`)),
-						Line("entity.Id = docRef.ID"),
+						Linef("_, err := r.Doc(entity.%s).Set(ctx, r.toFirestoreData(entity))", m.IDGoName),
+						Return("err"),
 					})),
-				Return("docRef.ID, nil"),
 			})),
 	})
 }
@@ -326,23 +473,13 @@ func CreateMethod(m MessageInfo) Code {
 func GetMethod(m MessageInfo) Code {
 	recv := "r *Firestore" + m.GoName + "Repository"
 	return Concat(CodeMonoid, []Code{
-		Blank(), Commentf("Get retrieves a %s by ID", m.GoName),
+		Blank(), Comment("Get retrieves a " + m.GoName + " by ID"),
 		Method(recv, "Get", "ctx context.Context, id string", "(*"+m.GoName+", error)",
 			Concat(CodeMonoid, []Code{
-				If(`id == ""`, Return("nil, ErrInvalidID")),
 				Line("doc, err := r.Doc(id).Get(ctx)"),
-				If("err != nil", Concat(CodeMonoid, []Code{
-					If("status.Code(err) == codes.NotFound", Return("nil, ErrNotFound")),
-					Return(`nil, fmt.Errorf("get failed: %w", err)`),
-				})),
+				If("status.Code(err) == codes.NotFound", Return("nil, ErrNotFound")),
+				If("err != nil", Return("nil, err")),
 				Return("r.fromFirestoreDoc(doc)"),
-			})),
-		Blank(), Commentf("GetOrNil returns nil if not found"),
-		Method(recv, "GetOrNil", "ctx context.Context, id string", "(*"+m.GoName+", error)",
-			Concat(CodeMonoid, []Code{
-				Line("entity, err := r.Get(ctx, id)"),
-				If("errors.Is(err, ErrNotFound)", Return("nil, nil")),
-				Return("entity, err"),
 			})),
 	})
 }
@@ -350,43 +487,13 @@ func GetMethod(m MessageInfo) Code {
 func UpdateMethod(m MessageInfo) Code {
 	recv := "r *Firestore" + m.GoName + "Repository"
 	return Concat(CodeMonoid, []Code{
-		Blank(), Commentf("Update updates an existing %s", m.GoName),
+		Blank(), Comment("Update modifies an existing " + m.GoName),
 		Method(recv, "Update", "ctx context.Context, entity *"+m.GoName, "error",
 			Concat(CodeMonoid, []Code{
-				If("entity == nil", Return(`errors.New("entity cannot be nil")`)),
-				If(`entity.Id == ""`, Return("ErrInvalidID")),
+				If(fmt.Sprintf("entity.%s == \"\"", m.IDGoName), Return("ErrInvalidID")),
 				When(m.HasUpdatedAt, Line("entity.UpdatedAt = timestamppb.Now()")),
-				Line("_, err := r.Doc(entity.Id).Set(ctx, r.toFirestoreData(entity))"),
+				Linef("_, err := r.Doc(entity.%s).Set(ctx, r.toFirestoreData(entity))", m.IDGoName),
 				Return("err"),
-			})),
-		Blank(), Commentf("UpdateFields updates specific fields"),
-		Method(recv, "UpdateFields", "ctx context.Context, id string, updates map[string]interface{}", "error",
-			Concat(CodeMonoid, []Code{
-				If(`id == ""`, Return("ErrInvalidID")),
-				When(m.HasUpdatedAt, Line(`updates["updated_at"] = firestore.ServerTimestamp`)),
-				Line("paths := make([]firestore.Update, 0, len(updates))"),
-				Line("for k, v := range updates { paths = append(paths, firestore.Update{Path: k, Value: v}) }"),
-				Line("_, err := r.Doc(id).Update(ctx, paths)"),
-				If("status.Code(err) == codes.NotFound", Return("ErrNotFound")),
-				Return("err"),
-			})),
-		Blank(), Commentf("Upsert creates or updates"),
-		Method(recv, "Upsert", "ctx context.Context, entity *"+m.GoName, "error",
-			Concat(CodeMonoid, []Code{
-				If("entity == nil", Return(`errors.New("entity cannot be nil")`)),
-				When(m.HasCreatedAt, If("entity.CreatedAt == nil", Line("entity.CreatedAt = timestamppb.Now()"))),
-				When(m.HasUpdatedAt, Line("entity.UpdatedAt = timestamppb.Now()")),
-				IfElse(`entity.Id == ""`,
-					Concat(CodeMonoid, []Code{
-						Line("docRef, _, err := r.Collection().Add(ctx, r.toFirestoreData(entity))"),
-						If("err != nil", Return("err")),
-						Line("entity.Id = docRef.ID"),
-						Return("nil"),
-					}),
-					Concat(CodeMonoid, []Code{
-						Line("_, err := r.Doc(entity.Id).Set(ctx, r.toFirestoreData(entity))"),
-						Return("err"),
-					})),
 			})),
 	})
 }
@@ -394,7 +501,7 @@ func UpdateMethod(m MessageInfo) Code {
 func DeleteMethod(m MessageInfo) Code {
 	recv := "r *Firestore" + m.GoName + "Repository"
 	return Concat(CodeMonoid, []Code{
-		Blank(), Commentf("Delete permanently deletes a %s", m.GoName),
+		Blank(), Comment("Delete removes a " + m.GoName + " by ID"),
 		Method(recv, "Delete", "ctx context.Context, id string", "error",
 			Concat(CodeMonoid, []Code{
 				If(`id == ""`, Return("ErrInvalidID")),
@@ -410,22 +517,17 @@ func SoftDeleteMethods(m MessageInfo) Code {
 	}
 	recv := "r *Firestore" + m.GoName + "Repository"
 	return Concat(CodeMonoid, []Code{
-		Blank(), Commentf("SoftDelete marks %s as deleted", m.GoName),
+		Blank(), Comment("SoftDelete marks entity as deleted without removing"),
 		Method(recv, "SoftDelete", "ctx context.Context, id string", "error",
 			Concat(CodeMonoid, []Code{
 				If(`id == ""`, Return("ErrInvalidID")),
-				Line("_, err := r.Doc(id).Update(ctx, []firestore.Update{"),
-				Line(`	{Path: "deleted_at", Value: firestore.ServerTimestamp},`),
-				When(m.HasUpdatedAt, Line(`	{Path: "updated_at", Value: firestore.ServerTimestamp},`)),
-				Line("})"),
-				If("status.Code(err) == codes.NotFound", Return("ErrNotFound")),
+				Line("_, err := r.Doc(id).Update(ctx, []firestore.Update{{Path: \"deleted_at\", Value: timestamppb.Now()}})"),
 				Return("err"),
 			})),
-		Blank(), Commentf("Restore restores soft-deleted %s", m.GoName),
-		Method(recv, "Restore", "ctx context.Context, id string", "error",
+		Blank(), Method(recv, "Restore", "ctx context.Context, id string", "error",
 			Concat(CodeMonoid, []Code{
 				If(`id == ""`, Return("ErrInvalidID")),
-				Line(`_, err := r.Doc(id).Update(ctx, []firestore.Update{{Path: "deleted_at", Value: nil}})`),
+				Line("_, err := r.Doc(id).Update(ctx, []firestore.Update{{Path: \"deleted_at\", Value: nil}})"),
 				Return("err"),
 			})),
 	})
@@ -434,21 +536,22 @@ func SoftDeleteMethods(m MessageInfo) Code {
 func ListMethod(m MessageInfo) Code {
 	recv := "r *Firestore" + m.GoName + "Repository"
 	return Concat(CodeMonoid, []Code{
-		Blank(), Commentf("List retrieves all %s", m.GoName),
-		Method(recv, "List", "ctx context.Context", "([]*"+m.GoName+", error)",
+		Blank(), Comment("List retrieves all " + m.GoName + "s with optional limit"),
+		Method(recv, "List", "ctx context.Context, limit int", "([]*"+m.GoName+", error)",
 			Concat(CodeMonoid, []Code{
-				Line("query := r.Collection().Query"),
-				When(m.HasDeletedAt, Line(`query = query.Where("deleted_at", "==", nil)`)),
-				Line("iter := query.Documents(ctx)"),
+				Line("q := r.Collection().Query"),
+				When(m.HasDeletedAt, Line("q = q.Where(\"deleted_at\", \"==\", nil)")),
+				If("limit > 0", Line("q = q.Limit(limit)")),
+				Line("iter := q.Documents(ctx)"),
 				Line("defer iter.Stop()"),
 				Linef("var results []*%s", m.GoName),
 				Line("for {"),
 				Line("\tdoc, err := iter.Next()"),
 				If("err == iterator.Done", Line("break")),
 				If("err != nil", Return("nil, err")),
-				Line("\tentity, err := r.fromFirestoreDoc(doc)"),
+				Line("\te, err := r.fromFirestoreDoc(doc)"),
 				If("err != nil", Return("nil, err")),
-				Line("\tresults = append(results, entity)"),
+				Line("\tresults = append(results, e)"),
 				Line("}"),
 				Return("results, nil"),
 			})),
@@ -458,10 +561,9 @@ func ListMethod(m MessageInfo) Code {
 func ExistsMethod(m MessageInfo) Code {
 	recv := "r *Firestore" + m.GoName + "Repository"
 	return Concat(CodeMonoid, []Code{
-		Blank(), Commentf("Exists checks if %s exists", m.GoName),
+		Blank(), Comment("Exists checks if a " + m.GoName + " exists"),
 		Method(recv, "Exists", "ctx context.Context, id string", "(bool, error)",
 			Concat(CodeMonoid, []Code{
-				If(`id == ""`, Return("false, ErrInvalidID")),
 				Line("doc, err := r.Doc(id).Get(ctx)"),
 				If("status.Code(err) == codes.NotFound", Return("false, nil")),
 				If("err != nil", Return("false, err")),
@@ -473,125 +575,85 @@ func ExistsMethod(m MessageInfo) Code {
 func CountMethod(m MessageInfo) Code {
 	recv := "r *Firestore" + m.GoName + "Repository"
 	return Concat(CodeMonoid, []Code{
-		Blank(), Commentf("Count returns total %s", m.GoName),
-		Method(recv, "Count", "ctx context.Context", "(int64, error)",
+		Blank(), Comment("Count returns the number of " + m.GoName + "s"),
+		Method(recv, "Count", "ctx context.Context", "(int, error)",
 			Concat(CodeMonoid, []Code{
-				Line("query := r.Collection().Query"),
-				When(m.HasDeletedAt, Line(`query = query.Where("deleted_at", "==", nil)`)),
-				Line(`agg, err := query.NewAggregationQuery().WithCount("count").Get(ctx)`),
+				Line("q := r.Collection().Query"),
+				When(m.HasDeletedAt, Line("q = q.Where(\"deleted_at\", \"==\", nil)")),
+				Line("docs, err := q.Documents(ctx).GetAll()"),
 				If("err != nil", Return("0, err")),
-				Line(`countResult, ok := agg["count"]`),
-				If("!ok || countResult == nil", Return("0, nil")),
-				Line("// AggregationResult stores the value directly"),
-				Line("intVal, ok := countResult.(*int64)"),
-				If("ok && intVal != nil", Return("*intVal, nil")),
-				Line("// Try interface conversion"),
-				Line("if v, ok := countResult.(int64); ok { return v, nil }"),
-				Return("0, nil"),
-			})),
-	})
-}
-
-func FindByFieldMethod(m MessageInfo, f FieldInfo) Code {
-	recv := "r *Firestore" + m.GoName + "Repository"
-	methodName := "FindBy" + f.GoName
-	fsField := toSnakeCase(f.Name)
-
-	if f.IsUnique {
-		return Concat(CodeMonoid, []Code{
-			Blank(), Commentf("%s finds %s by %s (unique)", methodName, m.GoName, f.Name),
-			Method(recv, methodName, fmt.Sprintf("ctx context.Context, %s %s", lowerFirst(f.GoName), f.GoType), "(*"+m.GoName+", error)",
-				Concat(CodeMonoid, []Code{
-					Linef(`query := r.Collection().Where(%q, "==", %s)`, fsField, lowerFirst(f.GoName)),
-					When(m.HasDeletedAt, Line(`query = query.Where("deleted_at", "==", nil)`)),
-					Line("query = query.Limit(1)"),
-					Line("iter := query.Documents(ctx)"),
-					Line("defer iter.Stop()"),
-					Line("doc, err := iter.Next()"),
-					If("err == iterator.Done", Return("nil, ErrNotFound")),
-					If("err != nil", Return("nil, err")),
-					Return("r.fromFirestoreDoc(doc)"),
-				})),
-		})
-	}
-
-	return Concat(CodeMonoid, []Code{
-		Blank(), Commentf("%s finds all %s by %s", methodName, m.GoName, f.Name),
-		Method(recv, methodName, fmt.Sprintf("ctx context.Context, %s %s, limit int", lowerFirst(f.GoName), f.GoType), "([]*"+m.GoName+", error)",
-			Concat(CodeMonoid, []Code{
-				Linef(`query := r.Collection().Where(%q, "==", %s)`, fsField, lowerFirst(f.GoName)),
-				When(m.HasDeletedAt, Line(`query = query.Where("deleted_at", "==", nil)`)),
-				If("limit > 0", Line("query = query.Limit(limit)")),
-				Line("iter := query.Documents(ctx)"),
-				Line("defer iter.Stop()"),
-				Linef("var results []*%s", m.GoName),
-				Line("for {"),
-				Line("\tdoc, err := iter.Next()"),
-				If("err == iterator.Done", Line("break")),
-				If("err != nil", Return("nil, err")),
-				Line("\tentity, err := r.fromFirestoreDoc(doc)"),
-				If("err != nil", Return("nil, err")),
-				Line("\tresults = append(results, entity)"),
-				Line("}"),
-				Return("results, nil"),
+				Return("len(docs), nil"),
 			})),
 	})
 }
 
 func FindMethods(m MessageInfo) Code {
-	indexed := Filter(m.Fields, func(f FieldInfo) bool { return (f.IsIndexed || f.IsUnique) && !f.IsID })
-	return FoldMap(indexed, CodeMonoid, func(f FieldInfo) Code { return FindByFieldMethod(m, f) })
+	indexedFields := Filter(m.Fields, func(f FieldInfo) bool { return f.IsIndexed && !f.IsID })
+	if len(indexedFields) == 0 {
+		return CodeMonoid.Empty()
+	}
+	recv := "r *Firestore" + m.GoName + "Repository"
+	return FoldMap(indexedFields, CodeMonoid, func(f FieldInfo) Code {
+		methodName := "FindBy" + f.GoName
+		paramType := f.GoType
+		if f.IsRepeated {
+			paramType = strings.TrimPrefix(paramType, "[]")
+		}
+		return Concat(CodeMonoid, []Code{
+			Blank(), Commentf("%s finds %ss by %s", methodName, m.GoName, f.Name),
+			Method(recv, methodName, "ctx context.Context, value "+paramType, "([]*"+m.GoName+", error)",
+				Concat(CodeMonoid, []Code{
+					Linef("q := r.Collection().Where(%q, \"==\", value)", toSnakeCase(f.Name)),
+					When(m.HasDeletedAt, Line("q = q.Where(\"deleted_at\", \"==\", nil)")),
+					Line("iter := q.Documents(ctx)"),
+					Line("defer iter.Stop()"),
+					Linef("var results []*%s", m.GoName),
+					Line("for {"),
+					Line("\tdoc, err := iter.Next()"),
+					If("err == iterator.Done", Line("break")),
+					If("err != nil", Return("nil, err")),
+					Line("\te, err := r.fromFirestoreDoc(doc)"),
+					If("err != nil", Return("nil, err")),
+					Line("\tresults = append(results, e)"),
+					Line("}"),
+					Return("results, nil"),
+				})),
+		})
+	})
 }
 
 func BatchMethods(m MessageInfo) Code {
 	recv := "r *Firestore" + m.GoName + "Repository"
 	return Concat(CodeMonoid, []Code{
 		Blank(), Comment("=== Batch Operations ==="),
-		Blank(), Commentf("BatchCreate creates multiple %s", m.GoName),
-		Method(recv, "BatchCreate", "ctx context.Context, entities []*"+m.GoName, "([]string, error)",
+		Blank(), Method(recv, "CreateBatch", "ctx context.Context, entities []*"+m.GoName, "error",
 			Concat(CodeMonoid, []Code{
-				If("len(entities) == 0", Return("nil, nil")),
-				If("len(entities) > 500", Return(`nil, errors.New("batch exceeds 500")`)),
+				If("len(entities) == 0", Return("nil")),
+				If("len(entities) > 500", Return("fmt.Errorf(\"batch size exceeds 500\")")),
 				Line("batch := r.client.Batch()"),
-				Line("ids := make([]string, len(entities))"),
-				Line("for i, e := range entities {"),
-				When(m.HasCreatedAt || m.HasUpdatedAt, Concat(CodeMonoid, []Code{
-					Line("\tnow := timestamppb.Now()"),
-					When(m.HasCreatedAt, Line("\te.CreatedAt = now")),
-					When(m.HasUpdatedAt, Line("\te.UpdatedAt = now")),
-				})),
-				Line("\tvar ref *firestore.DocumentRef"),
-				IfElse(`e.Id != ""`, Line("\tref = r.Doc(e.Id)"), Concat(CodeMonoid, []Code{Line("\tref = r.Collection().NewDoc()"), Line("\te.Id = ref.ID")})),
-				Line("\tbatch.Set(ref, r.toFirestoreData(e))"),
-				Line("\tids[i] = ref.ID"),
+				When(m.HasCreatedAt || m.HasUpdatedAt, Line("now := timestamppb.Now()")),
+				Line("for _, entity := range entities {"),
+				When(m.HasCreatedAt, Line("\tentity.CreatedAt = now")),
+				When(m.HasUpdatedAt, Line("\tentity.UpdatedAt = now")),
+				Linef("\tif entity.%s == \"\" {", m.IDGoName),
+				Line("\t\tref := r.Collection().NewDoc()"),
+				Linef("\t\tentity.%s = ref.ID", m.IDGoName),
+				Line("\t\tbatch.Set(ref, r.toFirestoreData(entity))"),
+				Line("\t} else {"),
+				Linef("\t\tbatch.Set(r.Doc(entity.%s), r.toFirestoreData(entity))", m.IDGoName),
+				Line("\t}"),
 				Line("}"),
 				Line("_, err := batch.Commit(ctx)"),
-				Return("ids, err"),
+				Return("err"),
 			})),
-		Blank(), Commentf("BatchGet retrieves multiple %s", m.GoName),
-		Method(recv, "BatchGet", "ctx context.Context, ids []string", "([]*"+m.GoName+", error)",
-			Concat(CodeMonoid, []Code{
-				If("len(ids) == 0", Return("nil, nil")),
-				Line("refs := make([]*firestore.DocumentRef, len(ids))"),
-				Line("for i, id := range ids { refs[i] = r.Doc(id) }"),
-				Line("docs, err := r.client.GetAll(ctx, refs)"),
-				If("err != nil", Return("nil, err")),
-				Linef("results := make([]*%s, 0, len(docs))", m.GoName),
-				Line("for _, doc := range docs {"),
-				If("!doc.Exists()", Line("continue")),
-				Line("\te, err := r.fromFirestoreDoc(doc)"),
-				If("err != nil", Return("nil, err")),
-				Line("\tresults = append(results, e)"),
-				Line("}"),
-				Return("results, nil"),
-			})),
-		Blank(), Commentf("BatchDelete deletes multiple %s", m.GoName),
-		Method(recv, "BatchDelete", "ctx context.Context, ids []string", "error",
+		Blank(), Method(recv, "DeleteBatch", "ctx context.Context, ids []string", "error",
 			Concat(CodeMonoid, []Code{
 				If("len(ids) == 0", Return("nil")),
-				If("len(ids) > 500", Return(`errors.New("batch exceeds 500")`)),
+				If("len(ids) > 500", Return("fmt.Errorf(\"batch size exceeds 500\")")),
 				Line("batch := r.client.Batch()"),
-				Line("for _, id := range ids { batch.Delete(r.Doc(id)) }"),
+				Line("for _, id := range ids {"),
+				Line("\tbatch.Delete(r.Doc(id))"),
+				Line("}"),
 				Line("_, err := batch.Commit(ctx)"),
 				Return("err"),
 			})),
@@ -599,24 +661,33 @@ func BatchMethods(m MessageInfo) Code {
 }
 
 func QueryBuilder(m MessageInfo) Code {
-	qn := m.GoName + "Query"
-	recv := "q *" + qn
+	recv := "r *Firestore" + m.GoName + "Repository"
+	qName := m.GoName + "Query"
+	qRecv := "q *" + qName
 	return Concat(CodeMonoid, []Code{
 		Blank(), Comment("=== Query Builder ==="),
-		Struct(qn, Concat(CodeMonoid, []Code{Field("repo", "*Firestore"+m.GoName+"Repository"), Field("query", "firestore.Query"), Field("limit", "int")})),
-		Blank(), Method("r *Firestore"+m.GoName+"Repository", "Query", "", "*"+qn, Return(fmt.Sprintf("&%s{repo: r, query: r.Collection().Query}", qn))),
-		Blank(), Method(recv, "Where", "field, op string, value interface{}", "*"+qn, Concat(CodeMonoid, []Code{Line("q.query = q.query.Where(field, op, value)"), Return("q")})),
-		Blank(), Method(recv, "OrderBy", "field string, dir firestore.Direction", "*"+qn, Concat(CodeMonoid, []Code{Line("q.query = q.query.OrderBy(field, dir)"), Return("q")})),
-		Blank(), Method(recv, "Limit", "n int", "*"+qn, Concat(CodeMonoid, []Code{Line("q.limit = n"), Return("q")})),
-		Blank(), Method(recv, "StartAfter", "doc *firestore.DocumentSnapshot", "*"+qn, Concat(CodeMonoid, []Code{Line("q.query = q.query.StartAfter(doc)"), Return("q")})),
-		When(m.HasDeletedAt, Concat(CodeMonoid, []Code{
-			Blank(), Method(recv, "ExcludeDeleted", "", "*"+qn, Concat(CodeMonoid, []Code{Line(`q.query = q.query.Where("deleted_at", "==", nil)`), Return("q")})),
+		Blank(), Struct(qName, Concat(CodeMonoid, []Code{
+			Field("repo", "*Firestore"+m.GoName+"Repository"),
+			Field("query", "firestore.Query"),
+			Field("limit", "int"),
+			Field("offset", "int"),
 		})),
-		Blank(), Method(recv, "Get", "ctx context.Context", "([]*"+m.GoName+", error)",
+		Blank(), Method(recv, "Query", "", "*"+qName,
 			Concat(CodeMonoid, []Code{
-				Line("query := q.query"),
-				If("q.limit > 0", Line("query = query.Limit(q.limit)")),
-				Line("iter := query.Documents(ctx)"),
+				Line("q := r.Collection().Query"),
+				When(m.HasDeletedAt, Line("q = q.Where(\"deleted_at\", \"==\", nil)")),
+				Return("&" + qName + "{repo: r, query: q}"),
+			})),
+		Blank(), Method(qRecv, "Where", "field string, op string, value interface{}", "*"+qName, Concat(CodeMonoid, []Code{Line("q.query = q.query.Where(field, op, value)"), Return("q")})),
+		Blank(), Method(qRecv, "OrderBy", "field string, dir firestore.Direction", "*"+qName, Concat(CodeMonoid, []Code{Line("q.query = q.query.OrderBy(field, dir)"), Return("q")})),
+		Blank(), Method(qRecv, "Limit", "n int", "*"+qName, Concat(CodeMonoid, []Code{Line("q.limit = n"), Return("q")})),
+		Blank(), Method(qRecv, "Offset", "n int", "*"+qName, Concat(CodeMonoid, []Code{Line("q.offset = n"), Return("q")})),
+		Blank(), Method(qRecv, "Get", "ctx context.Context", "([]*"+m.GoName+", error)",
+			Concat(CodeMonoid, []Code{
+				Line("q := q.query"),
+				If("q.limit > 0", Line("q = q.Limit(q.limit)")),
+				If("q.offset > 0", Line("q = q.Offset(q.offset)")),
+				Line("iter := q.Documents(ctx)"),
 				Line("defer iter.Stop()"),
 				Linef("var results []*%s", m.GoName),
 				Line("for {"),
@@ -629,7 +700,7 @@ func QueryBuilder(m MessageInfo) Code {
 				Line("}"),
 				Return("results, nil"),
 			})),
-		Blank(), Method(recv, "First", "ctx context.Context", "(*"+m.GoName+", error)",
+		Blank(), Method(qRecv, "First", "ctx context.Context", "(*"+m.GoName+", error)",
 			Concat(CodeMonoid, []Code{
 				Line("q.limit = 1"),
 				Line("results, err := q.Get(ctx)"),
@@ -662,15 +733,15 @@ func TransactionHelpers(m MessageInfo) Code {
 					When(m.HasCreatedAt, Line("entity.CreatedAt = now")),
 					When(m.HasUpdatedAt, Line("entity.UpdatedAt = now")),
 				})),
-				IfElse(`entity.Id == ""`,
-					Concat(CodeMonoid, []Code{Line("ref := t.repo.Collection().NewDoc()"), Line("entity.Id = ref.ID"), Return("t.tx.Create(ref, t.repo.toFirestoreData(entity))")}),
-					Return("t.tx.Create(t.repo.Doc(entity.Id), t.repo.toFirestoreData(entity))")),
+				IfElse(fmt.Sprintf("entity.%s == \"\"", m.IDGoName),
+					Concat(CodeMonoid, []Code{Line("ref := t.repo.Collection().NewDoc()"), Linef("entity.%s = ref.ID", m.IDGoName), Return("t.tx.Create(ref, t.repo.toFirestoreData(entity))")}),
+					Return(fmt.Sprintf("t.tx.Create(t.repo.Doc(entity.%s), t.repo.toFirestoreData(entity))", m.IDGoName))),
 			})),
 		Blank(), Method("t *"+txName, "Update", "entity *"+m.GoName, "error",
 			Concat(CodeMonoid, []Code{
-				If(`entity.Id == ""`, Return("ErrInvalidID")),
+				If(fmt.Sprintf("entity.%s == \"\"", m.IDGoName), Return("ErrInvalidID")),
 				When(m.HasUpdatedAt, Line("entity.UpdatedAt = timestamppb.Now()")),
-				Return("t.tx.Set(t.repo.Doc(entity.Id), t.repo.toFirestoreData(entity))"),
+				Return(fmt.Sprintf("t.tx.Set(t.repo.Doc(entity.%s), t.repo.toFirestoreData(entity))", m.IDGoName)),
 			})),
 		Blank(), Method("t *"+txName, "Delete", "id string", "error", Concat(CodeMonoid, []Code{If(`id == ""`, Return("ErrInvalidID")), Return("t.tx.Delete(t.repo.Doc(id))")})),
 	})
@@ -694,7 +765,7 @@ func Converters(m MessageInfo) Code {
 		Blank(), Method(recv, "fromFirestoreDoc", "doc *firestore.DocumentSnapshot", "(*"+m.GoName+", error)",
 			Concat(CodeMonoid, []Code{
 				If("!doc.Exists()", Return("nil, ErrNotFound")),
-				Linef("entity := &%s{Id: doc.Ref.ID}", m.GoName),
+				Linef("entity := &%s{%s: doc.Ref.ID}", m.GoName, m.IDGoName),
 				Line("data := doc.Data()"),
 				FoldMap(m.Fields, CodeMonoid, func(f FieldInfo) Code {
 					if f.IsID {
@@ -764,22 +835,15 @@ func MessageRepository(m MessageInfo) Code {
 	})
 }
 
-func GenerateFile(file *protogen.File) Code {
-	// Only process messages that look like entities (have an id field)
-	entityMessages := Filter(file.Messages, func(msg *protogen.Message) bool {
-		for _, field := range msg.Fields {
-			if strings.EqualFold(string(field.Desc.Name()), "id") {
-				return true
-			}
-		}
-		return false
-	})
-
+func GenerateFile(file *protogen.File, entityMessages []*protogen.Message, configs map[string]*EntityConfig) Code {
 	if len(entityMessages) == 0 {
 		return CodeMonoid.Empty()
 	}
 
-	messages := Map(entityMessages, ExtractMessageInfo)
+	messages := Map(entityMessages, func(msg *protogen.Message) MessageInfo {
+		return ExtractMessageInfo(msg, configs[string(msg.Desc.Name())])
+	})
+
 	return Concat(CodeMonoid, []Code{
 		Header(), Blank(), Package(string(file.GoPackageName)),
 		Imports("context", "fmt", "time", "", "cloud.google.com/go/firestore",
@@ -801,26 +865,25 @@ func main() {
 	protogen.Options{}.Run(func(gen *protogen.Plugin) error {
 		gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
 		errorsGenerated := false
+
 		for _, f := range gen.Files {
 			if !f.Generate || len(f.Messages) == 0 {
 				continue
 			}
 
-			// Check if file has any entity messages (with id field)
-			hasEntities := false
+			// Collect entity messages (those with entity option)
+			var entityMessages []*protogen.Message
+			configs := make(map[string]*EntityConfig)
+
 			for _, msg := range f.Messages {
-				for _, field := range msg.Fields {
-					if strings.EqualFold(string(field.Desc.Name()), "id") {
-						hasEntities = true
-						break
-					}
-				}
-				if hasEntities {
-					break
+				config := getEntityConfig(msg)
+				if config != nil && config.Generate {
+					entityMessages = append(entityMessages, msg)
+					configs[string(msg.Desc.Name())] = config
 				}
 			}
 
-			if !hasEntities {
+			if len(entityMessages) == 0 {
 				continue
 			}
 
@@ -830,8 +893,9 @@ func main() {
 				errFile.P(GenerateErrorsFile(string(f.GoPackageName)).Run())
 				errorsGenerated = true
 			}
+
 			g := gen.NewGeneratedFile(f.GeneratedFilenamePrefix+"_firestore.pb.go", f.GoImportPath)
-			g.P(GenerateFile(f).Run())
+			g.P(GenerateFile(f, entityMessages, configs).Run())
 		}
 		return nil
 	})
