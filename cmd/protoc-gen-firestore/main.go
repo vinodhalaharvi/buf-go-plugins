@@ -669,25 +669,25 @@ func QueryBuilder(m MessageInfo) Code {
 		Blank(), Struct(qName, Concat(CodeMonoid, []Code{
 			Field("repo", "*Firestore"+m.GoName+"Repository"),
 			Field("query", "firestore.Query"),
-			Field("limit", "int"),
-			Field("offset", "int"),
+			Field("limitVal", "int"),
+			Field("offsetVal", "int"),
 		})),
 		Blank(), Method(recv, "Query", "", "*"+qName,
 			Concat(CodeMonoid, []Code{
-				Line("q := r.Collection().Query"),
-				When(m.HasDeletedAt, Line("q = q.Where(\"deleted_at\", \"==\", nil)")),
-				Return("&" + qName + "{repo: r, query: q}"),
+				Line("baseQuery := r.Collection().Query"),
+				When(m.HasDeletedAt, Line("baseQuery = baseQuery.Where(\"deleted_at\", \"==\", nil)")),
+				Return("&" + qName + "{repo: r, query: baseQuery}"),
 			})),
 		Blank(), Method(qRecv, "Where", "field string, op string, value interface{}", "*"+qName, Concat(CodeMonoid, []Code{Line("q.query = q.query.Where(field, op, value)"), Return("q")})),
 		Blank(), Method(qRecv, "OrderBy", "field string, dir firestore.Direction", "*"+qName, Concat(CodeMonoid, []Code{Line("q.query = q.query.OrderBy(field, dir)"), Return("q")})),
-		Blank(), Method(qRecv, "Limit", "n int", "*"+qName, Concat(CodeMonoid, []Code{Line("q.limit = n"), Return("q")})),
-		Blank(), Method(qRecv, "Offset", "n int", "*"+qName, Concat(CodeMonoid, []Code{Line("q.offset = n"), Return("q")})),
+		Blank(), Method(qRecv, "Limit", "n int", "*"+qName, Concat(CodeMonoid, []Code{Line("q.limitVal = n"), Return("q")})),
+		Blank(), Method(qRecv, "Offset", "n int", "*"+qName, Concat(CodeMonoid, []Code{Line("q.offsetVal = n"), Return("q")})),
 		Blank(), Method(qRecv, "Get", "ctx context.Context", "([]*"+m.GoName+", error)",
 			Concat(CodeMonoid, []Code{
-				Line("q := q.query"),
-				If("q.limit > 0", Line("q = q.Limit(q.limit)")),
-				If("q.offset > 0", Line("q = q.Offset(q.offset)")),
-				Line("iter := q.Documents(ctx)"),
+				Line("finalQuery := q.query"),
+				If("q.limitVal > 0", Line("finalQuery = finalQuery.Limit(q.limitVal)")),
+				If("q.offsetVal > 0", Line("finalQuery = finalQuery.Offset(q.offsetVal)")),
+				Line("iter := finalQuery.Documents(ctx)"),
 				Line("defer iter.Stop()"),
 				Linef("var results []*%s", m.GoName),
 				Line("for {"),
@@ -702,7 +702,7 @@ func QueryBuilder(m MessageInfo) Code {
 			})),
 		Blank(), Method(qRecv, "First", "ctx context.Context", "(*"+m.GoName+", error)",
 			Concat(CodeMonoid, []Code{
-				Line("q.limit = 1"),
+				Line("q.limitVal = 1"),
 				Line("results, err := q.Get(ctx)"),
 				If("err != nil", Return("nil, err")),
 				If("len(results) == 0", Return("nil, ErrNotFound")),
@@ -853,14 +853,6 @@ func GenerateFile(file *protogen.File, entityMessages []*protogen.Message, confi
 	})
 }
 
-func GenerateErrorsFile(pkgName string) Code {
-	return Concat(CodeMonoid, []Code{
-		Header(), Blank(), Package(pkgName),
-		Imports("errors"),
-		CommonErrors(),
-	})
-}
-
 func main() {
 	protogen.Options{}.Run(func(gen *protogen.Plugin) error {
 		gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
@@ -887,7 +879,7 @@ func main() {
 				continue
 			}
 
-			// Generate errors file only once per package
+			// Generate errors file only once
 			if !errorsGenerated {
 				errFile := gen.NewGeneratedFile(f.GeneratedFilenamePrefix+"_errors.pb.go", f.GoImportPath)
 				errFile.P(GenerateErrorsFile(string(f.GoPackageName)).Run())
@@ -898,6 +890,14 @@ func main() {
 			g.P(GenerateFile(f, entityMessages, configs).Run())
 		}
 		return nil
+	})
+}
+
+func GenerateErrorsFile(pkgName string) Code {
+	return Concat(CodeMonoid, []Code{
+		Header(), Blank(), Package(pkgName),
+		Imports("errors"),
+		CommonErrors(),
 	})
 }
 
