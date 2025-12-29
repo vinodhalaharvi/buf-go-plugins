@@ -1,369 +1,351 @@
 // protoc-gen-wire generates Google Wire provider sets
-// Uses Category Theory: Monoid + Functor + Fold
-// Generates: RepositorySet, ServiceSet, RealtimeSet, FullSet
+// Uses entity options to determine which messages get providers
+// Generates: RepositorySet, ServiceSet, HandlerSet, ServerSet
 package main
 
 import (
 	"fmt"
 	"strings"
-	"unicode"
 
 	"google.golang.org/protobuf/compiler/protogen"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/descriptorpb"
 	pluginpb "google.golang.org/protobuf/types/pluginpb"
 )
 
-// =============================================================================
-// CATEGORY THEORY FOUNDATIONS
-// =============================================================================
+const entityExtensionNumber = 50000
 
-type Monoid[A any] struct {
-	Empty  func() A
-	Append func(A, A) A
-}
+// =============================================================================
+// CODE HELPERS
+// =============================================================================
 
 type Code struct{ Run func() string }
 
-var CodeMonoid = Monoid[Code]{
-	Empty:  func() Code { return Code{Run: func() string { return "" }} },
-	Append: func(a, b Code) Code { return Code{Run: func() string { return a.Run() + b.Run() }} },
-}
+var empty = Code{Run: func() string { return "" }}
 
-func FoldRight[A, B any](xs []A, z B, f func(A, B) B) B {
-	if len(xs) == 0 {
-		return z
+func append2(a, b Code) Code { return Code{Run: func() string { return a.Run() + b.Run() }} }
+
+func concat(codes ...Code) Code {
+	result := empty
+	for _, c := range codes {
+		result = append2(result, c)
 	}
-	return f(xs[0], FoldRight(xs[1:], z, f))
+	return result
 }
 
-func Concat[A any](m Monoid[A], xs []A) A {
-	return FoldRight(xs, m.Empty(), func(a A, acc A) A { return m.Append(a, acc) })
-}
-
-func Map[A, B any](xs []A, f func(A) B) []B {
-	return FoldRight(xs, []B{}, func(a A, acc []B) []B { return append([]B{f(a)}, acc...) })
-}
-
-func FoldMap[A, B any](xs []A, m Monoid[B], f func(A) B) B { return Concat(m, Map(xs, f)) }
-
-func Filter[A any](xs []A, pred func(A) bool) []A {
-	return FoldRight(xs, []A{}, func(a A, acc []A) []A {
-		if pred(a) {
-			return append([]A{a}, acc...)
-		}
-		return acc
-	})
-}
-
-func Line(s string) Code                            { return Code{Run: func() string { return s + "\n" }} }
-func Linef(format string, args ...interface{}) Code { return Line(fmt.Sprintf(format, args...)) }
-func Blank() Code                                   { return Line("") }
+func line(s string) Code                    { return Code{Run: func() string { return s + "\n" }} }
+func linef(f string, a ...interface{}) Code { return line(fmt.Sprintf(f, a...)) }
+func blank() Code                           { return line("") }
 
 // =============================================================================
-// MESSAGE INFO
+// ENTITY DETECTION
 // =============================================================================
 
-type MessageInfo struct {
-	Name, GoName string
-	HasID        bool
+func hasEntityOption(msg *protogen.Message) bool {
+	opts := msg.Desc.Options()
+	if opts == nil {
+		return false
+	}
+	optsProto, ok := opts.(*descriptorpb.MessageOptions)
+	if !ok {
+		return false
+	}
+	b, _ := proto.Marshal(optsProto)
+	return containsTag(b, entityExtensionNumber)
 }
 
-func ExtractMessageInfo(msg *protogen.Message) MessageInfo {
-	hasID := false
-	for _, field := range msg.Fields {
-		if strings.EqualFold(string(field.Desc.Name()), "id") {
-			hasID = true
+func containsTag(b []byte, fieldNum int32) bool {
+	tag := uint64(fieldNum<<3 | 2)
+	i := 0
+	for i < len(b) {
+		v, n := varint(b[i:])
+		if n == 0 {
 			break
 		}
+		if v == tag {
+			return true
+		}
+		i += n
+		switch v & 0x7 {
+		case 0:
+			_, vn := varint(b[i:])
+			i += vn
+		case 1:
+			i += 8
+		case 2:
+			length, ln := varint(b[i:])
+			i += ln + int(length)
+		case 5:
+			i += 4
+		default:
+			return false
+		}
 	}
-	return MessageInfo{
-		Name:   string(msg.Desc.Name()),
-		GoName: msg.GoIdent.GoName,
-		HasID:  hasID,
+	return false
+}
+
+func varint(b []byte) (uint64, int) {
+	var x uint64
+	for n := 0; n < len(b) && n < 10; n++ {
+		x |= uint64(b[n]&0x7f) << (7 * n)
+		if b[n] < 0x80 {
+			return x, n + 1
+		}
 	}
+	return 0, 0
+}
+
+// =============================================================================
+// INFO TYPES
+// =============================================================================
+
+type EntityInfo struct {
+	GoName string
+}
+
+type ServiceInfo struct {
+	GoName string
 }
 
 // =============================================================================
 // WIRE GENERATOR
 // =============================================================================
 
-func GenerateWire(messages []MessageInfo, pkgName string) Code {
-	// Filter to only entities (messages with ID field)
-	entities := Filter(messages, func(m MessageInfo) bool { return m.HasID })
-
-	return Concat(CodeMonoid, []Code{
-		generateHeader(pkgName),
-		generateFirestoreRepositorySet(entities),
-		generateInMemoryRepositorySet(entities),
-		generateRealtimeRepositorySet(entities),
-		generateServiceSet(entities),
-		generateFullSets(entities),
-		generateServerStruct(entities),
-		generateServerConstructor(entities),
-		generateWireInjectorsExample(entities, pkgName),
-	})
+func GenerateWire(entities []EntityInfo, services []ServiceInfo, pkgName, importPath string) Code {
+	return concat(
+		generateHeader(pkgName, importPath),
+		generateRepositorySet(entities),
+		generateRepositoryStruct(entities),
+		generateServiceProviders(services),
+		generateHandlerSet(services, importPath),
+		generateServerSet(),
+		generateServerStruct(services, importPath),
+		generateWireInjectorExample(pkgName, importPath),
+	)
 }
 
-func generateHeader(pkgName string) Code {
-	return Concat(CodeMonoid, []Code{
-		Line("// Code generated by protoc-gen-wire. DO NOT EDIT."),
-		Line("// Generated using Category Theory: Monoid + Functor + Fold"),
-		Blank(),
-		Linef("package %s", pkgName),
-		Blank(),
-		Line("import ("),
-		Line(`	"context"`),
-		Line(`	"net/http"`),
-		Blank(),
-		Line(`	"cloud.google.com/go/firestore"`),
-		Line(`	"github.com/google/wire"`),
-		Line(")"),
-		Blank(),
-	})
+func generateHeader(pkgName, importPath string) Code {
+	return concat(
+		line("// Code generated by protoc-gen-wire. DO NOT EDIT."),
+		line("// Wire dependency injection providers for proto-generated services."),
+		blank(),
+		linef("package %s", pkgName),
+		blank(),
+		line("import ("),
+		line(`	"net/http"`),
+		line(`	"time"`),
+		blank(),
+		line(`	"github.com/google/wire"`),
+		line(`	"github.com/rs/cors"`),
+		line(`	"golang.org/x/net/http2"`),
+		line(`	"golang.org/x/net/http2/h2c"`),
+		line(")"),
+		blank(),
+	)
 }
 
-func generateFirestoreRepositorySet(entities []MessageInfo) Code {
-	return Concat(CodeMonoid, []Code{
-		Line("// ============================================================================="),
-		Line("// FIRESTORE REPOSITORY PROVIDERS"),
-		Line("// ============================================================================="),
-		Blank(),
-		Line("// FirestoreRepositorySet provides all Firestore repository implementations."),
-		Line("// Use this set for production with a real Firestore database."),
-		Line("var FirestoreRepositorySet = wire.NewSet("),
-		FoldMap(entities, CodeMonoid, func(m MessageInfo) Code {
-			return Linef("	New%sFirestoreRepository,", m.GoName)
-		}),
-		Line(")"),
-		Blank(),
-		Line("// Firestore repository constructors that Wire will use"),
-		FoldMap(entities, CodeMonoid, func(m MessageInfo) Code {
-			return Concat(CodeMonoid, []Code{
-				Linef("func New%sFirestoreRepository(client *firestore.Client) %sRepository {", m.GoName, m.GoName),
-				Linef("	return New%sRepository(client)", m.GoName),
-				Line("}"),
-				Blank(),
-			})
-		}),
-	})
+func generateRepositorySet(entities []EntityInfo) Code {
+	providers := empty
+	for _, e := range entities {
+		providers = append2(providers, linef("	NewFirestore%sRepository,", e.GoName))
+	}
+
+	return concat(
+		line("// ============================================================================="),
+		line("// REPOSITORY PROVIDERS"),
+		line("// ============================================================================="),
+		blank(),
+		line("// RepositorySet provides all Firestore repositories."),
+		line("var RepositorySet = wire.NewSet("),
+		providers,
+		line("	NewRepositories,"),
+		line(")"),
+		blank(),
+	)
 }
 
-func generateInMemoryRepositorySet(entities []MessageInfo) Code {
-	return Concat(CodeMonoid, []Code{
-		Line("// ============================================================================="),
-		Line("// IN-MEMORY REPOSITORY PROVIDERS"),
-		Line("// ============================================================================="),
-		Blank(),
-		Line("// InMemoryRepositorySet provides all in-memory repository implementations."),
-		Line("// Use this set for testing and development without a database."),
-		Line("var InMemoryRepositorySet = wire.NewSet("),
-		FoldMap(entities, CodeMonoid, func(m MessageInfo) Code {
-			return Linef("	New%sInMemoryRepository,", m.GoName)
-		}),
-		Line(")"),
-		Blank(),
-		Line("// In-memory repository constructors that Wire will use"),
-		FoldMap(entities, CodeMonoid, func(m MessageInfo) Code {
-			return Concat(CodeMonoid, []Code{
-				Linef("func New%sInMemoryRepository() %sRepository {", m.GoName, m.GoName),
-				Linef("	return New%sRepository()", m.GoName),
-				Line("}"),
-				Blank(),
-			})
-		}),
-	})
-}
+func generateRepositoryStruct(entities []EntityInfo) Code {
+	fields := empty
+	for _, e := range entities {
+		fields = append2(fields, linef("	%s *Firestore%sRepository", e.GoName, e.GoName))
+	}
 
-func generateRealtimeRepositorySet(entities []MessageInfo) Code {
-	return Concat(CodeMonoid, []Code{
-		Line("// ============================================================================="),
-		Line("// REALTIME REPOSITORY WRAPPERS"),
-		Line("// ============================================================================="),
-		Blank(),
-		Line("// RealtimeRepositorySet wraps repositories with event publishing."),
-		Line("// Use this to add real-time updates via WebSocket."),
-		Line("var RealtimeRepositorySet = wire.NewSet("),
-		FoldMap(entities, CodeMonoid, func(m MessageInfo) Code {
-			return Linef("	Wrap%sWithRealtime,", m.GoName)
-		}),
-		Line(")"),
-		Blank(),
-		Line("// Realtime wrapper constructors"),
-		FoldMap(entities, CodeMonoid, func(m MessageInfo) Code {
-			return Concat(CodeMonoid, []Code{
-				Linef("func Wrap%sWithRealtime(repo %sRepository) %sRepository {", m.GoName, m.GoName, m.GoName),
-				Linef("	return New%sRepositoryWithEvents(repo)", m.GoName),
-				Line("}"),
-				Blank(),
-			})
-		}),
-	})
-}
+	params := empty
+	for _, e := range entities {
+		params = append2(params, linef("	%s *Firestore%sRepository,", lowerFirst(e.GoName), e.GoName))
+	}
 
-func generateServiceSet(entities []MessageInfo) Code {
-	return Concat(CodeMonoid, []Code{
-		Line("// ============================================================================="),
-		Line("// SERVICE PROVIDERS"),
-		Line("// ============================================================================="),
-		Blank(),
-		Line("// ServiceSet provides all service implementations."),
-		Line("// Services depend on repositories (either Firestore or InMemory)."),
-		Line("var ServiceSet = wire.NewSet("),
-		FoldMap(entities, CodeMonoid, func(m MessageInfo) Code {
-			return Linef("	New%sServiceServer,", m.GoName)
-		}),
-		Line(")"),
-		Blank(),
-	})
-}
+	assigns := empty
+	for _, e := range entities {
+		assigns = append2(assigns, linef("		%s: %s,", e.GoName, lowerFirst(e.GoName)))
+	}
 
-func generateFullSets(entities []MessageInfo) Code {
-	return Concat(CodeMonoid, []Code{
-		Line("// ============================================================================="),
-		Line("// FULL APPLICATION SETS"),
-		Line("// ============================================================================="),
-		Blank(),
-		Line("// ProductionSet wires everything for production (Firestore + Services)."),
-		Line("var ProductionSet = wire.NewSet("),
-		Line("	FirestoreRepositorySet,"),
-		Line("	ServiceSet,"),
-		Line("	NewServer,"),
-		Line(")"),
-		Blank(),
-		Line("// ProductionRealtimeSet adds real-time updates to production."),
-		Line("var ProductionRealtimeSet = wire.NewSet("),
-		Line("	FirestoreRepositorySet,"),
-		Line("	RealtimeRepositorySet,"),
-		Line("	ServiceSet,"),
-		Line("	NewServer,"),
-		Line(")"),
-		Blank(),
-		Line("// DevelopmentSet wires everything for development (InMemory + Services)."),
-		Line("var DevelopmentSet = wire.NewSet("),
-		Line("	InMemoryRepositorySet,"),
-		Line("	ServiceSet,"),
-		Line("	NewServer,"),
-		Line(")"),
-		Blank(),
-		Line("// TestSet is an alias for DevelopmentSet, useful for testing."),
-		Line("var TestSet = DevelopmentSet"),
-		Blank(),
-	})
-}
-
-func generateServerStruct(entities []MessageInfo) Code {
-	return Concat(CodeMonoid, []Code{
-		Line("// ============================================================================="),
-		Line("// SERVER"),
-		Line("// ============================================================================="),
-		Blank(),
-		Line("// Server holds all services and provides HTTP handlers."),
-		Line("type Server struct {"),
-		FoldMap(entities, CodeMonoid, func(m MessageInfo) Code {
-			return Linef("	%sService *%sServiceServer", m.GoName, m.GoName)
-		}),
-		Line("	mux *http.ServeMux"),
-		Line("}"),
-		Blank(),
-	})
-}
-
-func generateServerConstructor(entities []MessageInfo) Code {
-	// Build parameter list
-	params := FoldMap(entities, CodeMonoid, func(m MessageInfo) Code {
-		return Linef("	%sService *%sServiceServer,", lowerFirst(m.GoName), m.GoName)
-	})
-
-	// Build struct initialization
-	fields := FoldMap(entities, CodeMonoid, func(m MessageInfo) Code {
-		return Linef("		%sService: %sService,", m.GoName, lowerFirst(m.GoName))
-	})
-
-	// Build service registration
-	registrations := FoldMap(entities, CodeMonoid, func(m MessageInfo) Code {
-		return Linef("	Register%sServiceServer(s.mux, s.%sService)", m.GoName, m.GoName)
-	})
-
-	return Concat(CodeMonoid, []Code{
-		Line("// NewServer creates a new Server with all services wired."),
-		Line("func NewServer("),
-		params,
-		Line(") *Server {"),
-		Line("	s := &Server{"),
+	return concat(
+		line("// Repositories holds all repository instances."),
+		line("type Repositories struct {"),
 		fields,
-		Line("		mux: http.NewServeMux(),"),
-		Line("	}"),
-		Blank(),
-		Line("	// Register all services"),
-		registrations,
-		Blank(),
-		Line("	return s"),
-		Line("}"),
-		Blank(),
-		Line("// ServeHTTP implements http.Handler."),
-		Line("func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {"),
-		Line("	s.mux.ServeHTTP(w, r)"),
-		Line("}"),
-		Blank(),
-		Line("// Handler returns the HTTP handler with CORS support."),
-		Line("func (s *Server) Handler() http.Handler {"),
-		Line("	return WithCORS(s.mux)"),
-		Line("}"),
-		Blank(),
-		Line("// Run starts the server on the given address."),
-		Line("func (s *Server) Run(addr string) error {"),
-		Line(`	return http.ListenAndServe(addr, s.Handler())`),
-		Line("}"),
-		Blank(),
-	})
+		line("}"),
+		blank(),
+		line("// NewRepositories creates a Repositories container."),
+		line("func NewRepositories("),
+		params,
+		line(") *Repositories {"),
+		line("	return &Repositories{"),
+		assigns,
+		line("	}"),
+		line("}"),
+		blank(),
+	)
 }
 
-func generateWireInjectorsExample(entities []MessageInfo, pkgName string) Code {
-	return Concat(CodeMonoid, []Code{
-		Line("// ============================================================================="),
-		Line("// WIRE INJECTOR EXAMPLES (copy to wire.go)"),
-		Line("// ============================================================================="),
-		Blank(),
-		Line("/*"),
-		Line("// wire.go - Copy this to your project and run `wire`"),
-		Blank(),
-		Line("//go:build wireinject"),
-		Blank(),
-		Line("package main"),
-		Blank(),
-		Line("import ("),
-		Line(`	"context"`),
-		Blank(),
-		Line(`	"cloud.google.com/go/firestore"`),
-		Line(`	"github.com/google/wire"`),
-		Linef(`	%s "your/import/path"`, pkgName),
-		Line(")"),
-		Blank(),
-		Line("// InitializeProductionServer creates a production server with Firestore."),
-		Line("func InitializeProductionServer(ctx context.Context, client *firestore.Client) (*Server, error) {"),
-		Line("	wire.Build(ProductionSet)"),
-		Line("	return nil, nil"),
-		Line("}"),
-		Blank(),
-		Line("// InitializeProductionRealtimeServer creates a production server with real-time."),
-		Line("func InitializeProductionRealtimeServer(ctx context.Context, client *firestore.Client) (*Server, error) {"),
-		Line("	wire.Build(ProductionRealtimeSet)"),
-		Line("	return nil, nil"),
-		Line("}"),
-		Blank(),
-		Line("// InitializeDevelopmentServer creates a development server with in-memory repos."),
-		Line("func InitializeDevelopmentServer() (*Server, error) {"),
-		Line("	wire.Build(DevelopmentSet)"),
-		Line("	return nil, nil"),
-		Line("}"),
-		Blank(),
-		Line("// InitializeTestServer creates a test server (same as development)."),
-		Line("func InitializeTestServer() (*Server, error) {"),
-		Line("	wire.Build(TestSet)"),
-		Line("	return nil, nil"),
-		Line("}"),
-		Line("*/"),
-		Blank(),
-	})
+func generateServiceProviders(services []ServiceInfo) Code {
+	return concat(
+		line("// ============================================================================="),
+		line("// SERVICE PROVIDERS"),
+		line("// ============================================================================="),
+		blank(),
+		line("// ServiceSet provides all service implementations."),
+		line("// Note: Custom services (TokenService, UserService, etc.) should be"),
+		line("// provided separately as they require custom logic."),
+		line("var ServiceSet = wire.NewSet("),
+		line("	// Add custom service providers here"),
+		line(")"),
+		blank(),
+	)
+}
+
+func generateHandlerSet(services []ServiceInfo, importPath string) Code {
+	// Handler wiring requires custom service implementations
+	// This is a placeholder - wire handlers manually in main.go
+	return concat(
+		line("// ============================================================================="),
+		line("// HANDLER REGISTRATION HELPERS"),
+		line("// ============================================================================="),
+		blank(),
+		line("// RegisterHandlers registers all Connect handlers with the mux."),
+		line("// Call this from main.go after creating your services."),
+		line("// Example:"),
+		line("//   mux := NewServerMux()"),
+		line("//   mux.Handle(purecertsv1connect.NewUserServiceHandler(userSvc))"),
+		line("//   mux.Handle(purecertsv1connect.NewTokenServiceHandler(tokenSvc))"),
+		line("//   ..."),
+		blank(),
+	)
+}
+
+func generateServerSet() Code {
+	return concat(
+		line("// ============================================================================="),
+		line("// SERVER SET"),
+		line("// ============================================================================="),
+		blank(),
+		line("// ServerSet wires repositories + handlers into a server."),
+		line("var ServerSet = wire.NewSet("),
+		line("	RepositorySet,"),
+		line("	// ServiceSet, // Uncomment when custom services added"),
+		line("	// HandlerSet, // Uncomment when handlers wired"),
+		line("	NewServerMux,"),
+		line("	NewHTTPServer,"),
+		line(")"),
+		blank(),
+	)
+}
+
+func generateServerStruct(services []ServiceInfo, importPath string) Code {
+	return concat(
+		line("// ============================================================================="),
+		line("// SERVER HELPERS"),
+		line("// ============================================================================="),
+		blank(),
+		line("// ServerConfig holds server configuration."),
+		line("type ServerConfig struct {"),
+		line("	Port            string"),
+		line("	AllowedOrigins  []string"),
+		line("	ReadTimeout     time.Duration"),
+		line("	WriteTimeout    time.Duration"),
+		line("}"),
+		blank(),
+		line("// DefaultServerConfig returns sensible defaults."),
+		line("func DefaultServerConfig() *ServerConfig {"),
+		line("	return &ServerConfig{"),
+		line(`		Port:           "8080",`),
+		line(`		AllowedOrigins: []string{"http://localhost:3000", "http://localhost:5173"},`),
+		line("		ReadTimeout:    30 * time.Second,"),
+		line("		WriteTimeout:   30 * time.Second,"),
+		line("	}"),
+		line("}"),
+		blank(),
+		line("// NewServerMux creates a new HTTP mux."),
+		line("func NewServerMux() *http.ServeMux {"),
+		line("	mux := http.NewServeMux()"),
+		line("	"),
+		line("	// Health check"),
+		line(`	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {`),
+		line(`		w.Header().Set("Content-Type", "application/json")`),
+		line("		w.Write([]byte(`{\"status\":\"ok\"}`))"),
+		line("	})"),
+		line("	"),
+		line("	return mux"),
+		line("}"),
+		blank(),
+		line("// RegisterHandler registers a Connect handler with the mux."),
+		line("func RegisterHandler(mux *http.ServeMux, path string, handler http.Handler) {"),
+		line("	mux.Handle(path, handler)"),
+		line("}"),
+		blank(),
+		line("// NewHTTPServer creates an HTTP server with CORS and HTTP/2."),
+		line("func NewHTTPServer(mux *http.ServeMux, cfg *ServerConfig) *http.Server {"),
+		line("	if cfg == nil {"),
+		line("		cfg = DefaultServerConfig()"),
+		line("	}"),
+		blank(),
+		line("	corsHandler := cors.New(cors.Options{"),
+		line("		AllowedOrigins:   cfg.AllowedOrigins,"),
+		line(`		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},`),
+		line(`		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "Connect-Protocol-Version"},`),
+		line(`		ExposedHeaders:   []string{"Grpc-Status", "Grpc-Message"},`),
+		line("		AllowCredentials: true,"),
+		line("	}).Handler(mux)"),
+		blank(),
+		line("	return &http.Server{"),
+		line(`		Addr:         ":" + cfg.Port,`),
+		line("		Handler:      h2c.NewHandler(corsHandler, &http2.Server{}),"),
+		line("		ReadTimeout:  cfg.ReadTimeout,"),
+		line("		WriteTimeout: cfg.WriteTimeout,"),
+		line("	}"),
+		line("}"),
+		blank(),
+	)
+}
+
+func generateWireInjectorExample(pkgName, importPath string) Code {
+	return concat(
+		line("// ============================================================================="),
+		line("// WIRE INJECTOR EXAMPLE"),
+		line("// ============================================================================="),
+		blank(),
+		line("/*"),
+		line("Copy this to cmd/server/wire.go:"),
+		blank(),
+		line("//go:build wireinject"),
+		blank(),
+		line("package main"),
+		blank(),
+		line("import ("),
+		line(`	"cloud.google.com/go/firestore"`),
+		line(`	"github.com/google/wire"`),
+		linef(`	pb "%s"`, importPath),
+		line(")"),
+		blank(),
+		line("func InitializeServer(client *firestore.Client, cfg *pb.ServerConfig) (*http.Server, error) {"),
+		line("	wire.Build(pb.ServerSet)"),
+		line("	return nil, nil"),
+		line("}"),
+		blank(),
+		line("Then run: wire ./cmd/server"),
+		line("*/"),
+		blank(),
+	)
 }
 
 // =============================================================================
@@ -373,23 +355,35 @@ func generateWireInjectorsExample(entities []MessageInfo, pkgName string) Code {
 func main() {
 	protogen.Options{}.Run(func(gen *protogen.Plugin) error {
 		gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
+
 		for _, f := range gen.Files {
-			if !f.Generate || len(f.Messages) == 0 {
+			if !f.Generate {
 				continue
 			}
 
-			messages := Map(f.Messages, ExtractMessageInfo)
-			entities := Filter(messages, func(m MessageInfo) bool { return m.HasID })
+			// Find entities (messages with entity option)
+			var entities []EntityInfo
+			for _, msg := range f.Messages {
+				if hasEntityOption(msg) {
+					entities = append(entities, EntityInfo{GoName: msg.GoIdent.GoName})
+				}
+			}
 
-			if len(entities) == 0 {
+			// Find services
+			var services []ServiceInfo
+			for _, svc := range f.Services {
+				services = append(services, ServiceInfo{GoName: svc.GoName})
+			}
+
+			if len(entities) == 0 && len(services) == 0 {
 				continue
 			}
 
 			pkgName := string(f.GoPackageName)
+			importPath := string(f.GoImportPath)
 
-			// Generate Wire providers
-			wireFile := gen.NewGeneratedFile(f.GeneratedFilenamePrefix+"_wire.pb.go", f.GoImportPath)
-			wireFile.P(GenerateWire(messages, pkgName).Run())
+			g := gen.NewGeneratedFile(f.GeneratedFilenamePrefix+"_wire.pb.go", f.GoImportPath)
+			g.P(GenerateWire(entities, services, pkgName, importPath).Run())
 		}
 		return nil
 	})
@@ -404,15 +398,4 @@ func lowerFirst(s string) string {
 		return s
 	}
 	return strings.ToLower(s[:1]) + s[1:]
-}
-
-func toSnakeCase(s string) string {
-	var result []rune
-	for i, r := range s {
-		if i > 0 && unicode.IsUpper(r) {
-			result = append(result, '_')
-		}
-		result = append(result, unicode.ToLower(r))
-	}
-	return string(result)
 }
