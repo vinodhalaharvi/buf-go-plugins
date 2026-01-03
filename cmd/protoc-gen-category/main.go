@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/example/protoc-gen-category/internal/generator"
+	"github.com/vinodhalaharvi/buf-go-plugins/cmd/protoc-gen-category/internal/generator"
 	"google.golang.org/protobuf/compiler/protogen"
 )
 
