@@ -1,5 +1,11 @@
 // protoc-gen-connect-server generates Connect RPC service implementations
-// wired to Firestore repositories. Only generates Get/List/Delete.
+// Fully generic - works with ANY proto file using proper proto reflection.
+// Uses Category Theory: Monoid, Functor (Map), Fold, Filter
+//
+// Pattern Detection (by TYPE signature, not name):
+//   - Get:    Input has ID field referencing entity → Output IS the entity
+//   - List:   Output has repeated entity field
+//   - Delete: Input has ID field referencing entity → Output is Empty
 package main
 
 import (
@@ -16,49 +22,80 @@ import (
 const entityExtensionNumber = 50000
 
 // =============================================================================
-// MONOID + HELPERS
+// CATEGORY THEORY FOUNDATIONS
 // =============================================================================
+
+type Monoid[A any] struct {
+	Empty  func() A
+	Append func(A, A) A
+}
 
 type Code struct{ Run func() string }
 
-var empty = Code{Run: func() string { return "" }}
-
-func append2(a, b Code) Code { return Code{Run: func() string { return a.Run() + b.Run() }} }
-
-func concat(codes ...Code) Code {
-	result := empty
-	for _, c := range codes {
-		result = append2(result, c)
-	}
-	return result
+var CodeMonoid = Monoid[Code]{
+	Empty:  func() Code { return Code{Run: func() string { return "" }} },
+	Append: func(a, b Code) Code { return Code{Run: func() string { return a.Run() + b.Run() }} },
 }
 
-func line(s string) Code                    { return Code{Run: func() string { return s + "\n" }} }
-func linef(f string, a ...interface{}) Code { return line(fmt.Sprintf(f, a...)) }
-func blank() Code                           { return line("") }
-func comment(s string) Code                 { return line("// " + s) }
+func FoldRight[A, B any](xs []A, z B, f func(A, B) B) B {
+	if len(xs) == 0 {
+		return z
+	}
+	return f(xs[0], FoldRight(xs[1:], z, f))
+}
 
-func indent(c Code) Code {
-	return Code{Run: func() string {
-		var result []string
-		for _, l := range strings.Split(c.Run(), "\n") {
-			if l == "" {
-				result = append(result, "")
-			} else {
-				result = append(result, "\t"+l)
-			}
+func Concat[A any](m Monoid[A], xs []A) A {
+	return FoldRight(xs, m.Empty(), func(a A, acc A) A { return m.Append(a, acc) })
+}
+
+func Map[A, B any](xs []A, f func(A) B) []B {
+	return FoldRight(xs, []B{}, func(a A, acc []B) []B { return append([]B{f(a)}, acc...) })
+}
+
+func FoldMap[A, B any](xs []A, m Monoid[B], f func(A) B) B {
+	return Concat(m, Map(xs, f))
+}
+
+func Filter[A any](xs []A, pred func(A) bool) []A {
+	return FoldRight(xs, []A{}, func(a A, acc []A) []A {
+		if pred(a) {
+			return append([]A{a}, acc...)
 		}
-		return strings.Join(result, "\n")
+		return acc
+	})
+}
+
+// =============================================================================
+// CODE PRIMITIVES
+// =============================================================================
+
+func Line(s string) Code                    { return Code{Run: func() string { return s + "\n" }} }
+func Linef(f string, a ...interface{}) Code { return Line(fmt.Sprintf(f, a...)) }
+func Blank() Code                           { return Line("") }
+func Comment(s string) Code                 { return Line("// " + s) }
+
+func Indent(c Code) Code {
+	return Code{Run: func() string {
+		lines := strings.Split(c.Run(), "\n")
+		indented := Map(lines, func(l string) string {
+			if l == "" {
+				return ""
+			}
+			return "\t" + l
+		})
+		return strings.Join(indented, "\n")
 	}}
 }
 
 // =============================================================================
-// ENTITY CONFIG
+// ENTITY INFO - Extracted via proto reflection
 // =============================================================================
 
-type EntityConfig struct {
-	GoName   string
-	IDGoName string
+type EntityInfo struct {
+	GoName    string
+	IDField   string
+	IDGoName  string
+	RepoField string
 }
 
 func hasEntityOption(msg *protogen.Message) bool {
@@ -71,14 +108,14 @@ func hasEntityOption(msg *protogen.Message) bool {
 		return false
 	}
 	b, _ := proto.Marshal(optsProto)
-	return containsTag(b, entityExtensionNumber)
+	return containsExtension(b, entityExtensionNumber)
 }
 
-func containsTag(b []byte, fieldNum int32) bool {
+func containsExtension(b []byte, fieldNum int32) bool {
 	tag := uint64(fieldNum<<3 | 2)
 	i := 0
 	for i < len(b) {
-		v, n := varint(b[i:])
+		v, n := decodeVarint(b[i:])
 		if n == 0 {
 			break
 		}
@@ -88,12 +125,12 @@ func containsTag(b []byte, fieldNum int32) bool {
 		i += n
 		switch v & 0x7 {
 		case 0:
-			_, vn := varint(b[i:])
+			_, vn := decodeVarint(b[i:])
 			i += vn
 		case 1:
 			i += 8
 		case 2:
-			length, ln := varint(b[i:])
+			length, ln := decodeVarint(b[i:])
 			i += ln + int(length)
 		case 5:
 			i += 4
@@ -104,7 +141,7 @@ func containsTag(b []byte, fieldNum int32) bool {
 	return false
 }
 
-func varint(b []byte) (uint64, int) {
+func decodeVarint(b []byte) (uint64, int) {
 	var x uint64
 	for n := 0; n < len(b) && n < 10; n++ {
 		x |= uint64(b[n]&0x7f) << (7 * n)
@@ -115,262 +152,371 @@ func varint(b []byte) (uint64, int) {
 	return 0, 0
 }
 
-func getEntityConfig(msg *protogen.Message) *EntityConfig {
-	if !hasEntityOption(msg) {
-		return nil
+func ExtractEntityInfo(msg *protogen.Message) EntityInfo {
+	idField, idGoName := findIDField(msg)
+	return EntityInfo{
+		GoName:    msg.GoIdent.GoName,
+		IDField:   idField,
+		IDGoName:  idGoName,
+		RepoField: msg.GoIdent.GoName,
 	}
-	idGoName := "Id"
+}
+
+func findIDField(msg *protogen.Message) (string, string) {
+	for _, f := range msg.Fields {
+		if strings.EqualFold(string(f.Desc.Name()), "id") {
+			return string(f.Desc.Name()), f.GoName
+		}
+	}
 	for _, f := range msg.Fields {
 		name := string(f.Desc.Name())
-		if strings.EqualFold(name, "id") {
-			idGoName = f.GoName
-			break
-		}
-		if strings.HasSuffix(strings.ToLower(name), "_id") && idGoName == "Id" {
-			idGoName = f.GoName
+		if strings.HasSuffix(name, "_id") {
+			return name, f.GoName
 		}
 	}
-	return &EntityConfig{GoName: msg.GoIdent.GoName, IDGoName: idGoName}
+	for _, f := range msg.Fields {
+		if f.Desc.Kind() == protoreflect.StringKind {
+			return string(f.Desc.Name()), f.GoName
+		}
+	}
+	return "id", "Id"
 }
 
 // =============================================================================
-// METHOD INFO
+// METHOD PATTERN DETECTION - By type signature
 // =============================================================================
+
+type MethodPattern int
+
+const (
+	PatternUnknown MethodPattern = iota
+	PatternGet
+	PatternList
+	PatternDelete
+)
 
 type MethodInfo struct {
-	GoName     string
-	InputType  string
-	OutputType string
-	OutputMsg  *protogen.Message
-	Entity     string
-	Config     *EntityConfig
-	Op         string
+	GoName      string
+	InputType   string
+	OutputType  string
+	Pattern     MethodPattern
+	Entity      *EntityInfo
+	ListField   string
+	IDFieldName string
 }
 
-func extractMethods(svc *protogen.Service, entities map[string]*EntityConfig, file *protogen.File) []MethodInfo {
-	var methods []MethodInfo
-	for _, m := range svc.Methods {
-		name := string(m.Desc.Name())
-		op := ""
-		entity := ""
+func DetectPattern(m *protogen.Method, entities map[string]*EntityInfo) *MethodInfo {
+	inputMsg := m.Input
+	outputMsg := m.Output
+	inputName := inputMsg.GoIdent.GoName
+	outputName := outputMsg.GoIdent.GoName
 
-		if strings.HasPrefix(name, "Get") {
-			op = "get"
-			entity = strings.TrimPrefix(name, "Get")
-		} else if strings.HasPrefix(name, "List") {
-			op = "list"
-			entity = strings.TrimSuffix(strings.TrimPrefix(name, "List"), "s")
-		} else if strings.HasPrefix(name, "Delete") {
-			op = "delete"
-			entity = strings.TrimPrefix(name, "Delete")
-		}
-
-		if op == "" {
-			continue
-		}
-
-		// Skip special methods
-		if entity == "CurrentUser" || entity == "CurrentSession" || entity == "Subscription" ||
-			entity == "BillingPortalUrl" || entity == "Usage" || entity == "TenantStat" ||
-			entity == "2FAStatus" || entity == "CAChain" || entity == "CRL" {
-			continue
-		}
-
-		config := entities[entity]
-		if config == nil {
-			continue
-		}
-
-		// Find output message
-		var outputMsg *protogen.Message
-		for _, msg := range file.Messages {
-			if msg.GoIdent.GoName == m.Output.GoIdent.GoName {
-				outputMsg = msg
-				break
+	// Pattern: Output is Empty AND Input has entity ID field → Delete
+	if outputName == "Empty" {
+		if entity, idField := findEntityIDField(inputMsg, entities); entity != nil {
+			return &MethodInfo{
+				GoName:      m.GoName,
+				InputType:   inputName,
+				OutputType:  "emptypb.Empty",
+				Pattern:     PatternDelete,
+				Entity:      entity,
+				IDFieldName: idField,
 			}
 		}
-
-		methods = append(methods, MethodInfo{
-			GoName:     m.GoName,
-			InputType:  fixEmptyType(m.Input.GoIdent.GoName),
-			OutputType: fixEmptyType(m.Output.GoIdent.GoName),
-			OutputMsg:  outputMsg,
-			Entity:     entity,
-			Config:     config,
-			Op:         op,
-		})
 	}
-	return methods
+
+	// Pattern: Output IS an entity AND Input has that entity's ID field → Get
+	if entity, ok := entities[outputName]; ok {
+		if idField := findMatchingIDField(inputMsg, entity); idField != "" {
+			return &MethodInfo{
+				GoName:      m.GoName,
+				InputType:   inputName,
+				OutputType:  outputName,
+				Pattern:     PatternGet,
+				Entity:      entity,
+				IDFieldName: idField,
+			}
+		}
+	}
+
+	// Pattern: Output has repeated entity field → List
+	if entity, listField := findRepeatedEntityField(outputMsg, entities); entity != nil {
+		return &MethodInfo{
+			GoName:     m.GoName,
+			InputType:  fixEmptyType(inputName),
+			OutputType: outputName,
+			Pattern:    PatternList,
+			Entity:     entity,
+			ListField:  listField,
+		}
+	}
+
+	return nil
+}
+
+// findEntityIDField finds an ID field in the input message that references any entity
+func findEntityIDField(msg *protogen.Message, entities map[string]*EntityInfo) (*EntityInfo, string) {
+	for _, f := range msg.Fields {
+		if f.Desc.Kind() != protoreflect.StringKind {
+			continue
+		}
+		fieldName := string(f.Desc.Name())
+
+		// Check each entity to see if this field is its ID
+		for _, entity := range entities {
+			// Match: field name equals entity's ID field
+			if fieldName == entity.IDField {
+				return entity, f.GoName
+			}
+			// Match: field name is {lowercase_entity}_id
+			expectedID := strings.ToLower(entity.GoName) + "_id"
+			if fieldName == expectedID {
+				return entity, f.GoName
+			}
+		}
+	}
+	return nil, ""
+}
+
+// findMatchingIDField finds the ID field for a specific entity
+func findMatchingIDField(msg *protogen.Message, entity *EntityInfo) string {
+	for _, f := range msg.Fields {
+		if f.Desc.Kind() != protoreflect.StringKind {
+			continue
+		}
+		fieldName := string(f.Desc.Name())
+
+		if fieldName == entity.IDField {
+			return f.GoName
+		}
+		expectedID := strings.ToLower(entity.GoName) + "_id"
+		if fieldName == expectedID {
+			return f.GoName
+		}
+	}
+	return ""
+}
+
+// findRepeatedEntityField finds a repeated field containing an entity type
+func findRepeatedEntityField(msg *protogen.Message, entities map[string]*EntityInfo) (*EntityInfo, string) {
+	for _, f := range msg.Fields {
+		if !f.Desc.IsList() || f.Desc.Kind() != protoreflect.MessageKind {
+			continue
+		}
+		elemTypeName := f.Message.GoIdent.GoName
+		if entity, ok := entities[elemTypeName]; ok {
+			return entity, f.GoName
+		}
+	}
+	return nil, ""
+}
+
+func fixEmptyType(t string) string {
+	if t == "Empty" {
+		return "emptypb.Empty"
+	}
+	return t
 }
 
 // =============================================================================
 // CODE GENERATORS
 // =============================================================================
 
-func genGet(m MethodInfo) Code {
-	e := lowerFirst(m.Entity)
-	return concat(
-		linef("id := req.Msg.Get%s()", m.Config.IDGoName),
-		line(`if id == "" {`),
-		line(`	return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("id is required"))`),
-		line(`}`),
-		blank(),
-		linef("entity, err := s.%sRepo.Get(ctx, id)", e),
-		line("if err != nil {"),
-		line("	if errors.Is(err, ErrNotFound) {"),
-		line("		return nil, connect.NewError(connect.CodeNotFound, err)"),
-		line("	}"),
-		line("	return nil, connect.NewError(connect.CodeInternal, err)"),
-		line("}"),
-		blank(),
-		line("return connect.NewResponse(entity), nil"),
-	)
+func GenGet(svcName string, m *MethodInfo, baseAlias string) Code {
+	inputType := baseAlias + "." + m.InputType
+	outputType := baseAlias + "." + m.OutputType
+
+	return Concat(CodeMonoid, []Code{
+		Blank(),
+		Linef("func (s *%sServer) %s(ctx context.Context, req *connect.Request[%s]) (*connect.Response[%s], error) {",
+			svcName, m.GoName, inputType, outputType),
+		Indent(Concat(CodeMonoid, []Code{
+			Linef("id := req.Msg.Get%s()", m.IDFieldName),
+			Line(`if id == "" {`),
+			Line(`	return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("id required"))`),
+			Line(`}`),
+			Blank(),
+			Linef("entity, err := s.repos.%s.Get(ctx, id)", m.Entity.RepoField),
+			Line("if err != nil {"),
+			Linef("	if errors.Is(err, %s.ErrNotFound) {", baseAlias),
+			Line("		return nil, connect.NewError(connect.CodeNotFound, err)"),
+			Line("	}"),
+			Line("	return nil, connect.NewError(connect.CodeInternal, err)"),
+			Line("}"),
+			Blank(),
+			Line("return connect.NewResponse(entity), nil"),
+		})),
+		Line("}"),
+	})
 }
 
-func genList(m MethodInfo) Code {
-	e := lowerFirst(m.Entity)
-
-	// Find the repeated field name in output message
-	listField := m.Entity + "s"
-	if m.OutputMsg != nil {
-		for _, f := range m.OutputMsg.Fields {
-			if f.Desc.IsList() && f.Desc.Kind() == protoreflect.MessageKind {
-				listField = f.GoName
-				break
-			}
-		}
+func GenList(svcName string, m *MethodInfo, baseAlias string) Code {
+	inputType := m.InputType
+	if inputType != "emptypb.Empty" {
+		inputType = baseAlias + "." + inputType
 	}
+	outputType := baseAlias + "." + m.OutputType
 
-	// Handle Empty input (no pagination) vs normal request with GetLimit
 	var limitCode Code
 	if m.InputType == "emptypb.Empty" {
-		limitCode = line("limit := 100")
+		limitCode = Line("limit := 100")
 	} else {
-		limitCode = concat(
-			line("limit := int(req.Msg.GetLimit())"),
-			line("if limit <= 0 || limit > 100 {"),
-			line("	limit = 100"),
-			line("}"),
-		)
+		limitCode = Concat(CodeMonoid, []Code{
+			Line("limit := int(req.Msg.GetLimit())"),
+			Line("if limit <= 0 || limit > 100 {"),
+			Line("	limit = 100"),
+			Line("}"),
+		})
 	}
 
-	return concat(
-		limitCode,
-		blank(),
-		linef("entities, err := s.%sRepo.List(ctx, limit)", e),
-		line("if err != nil {"),
-		line("	return nil, connect.NewError(connect.CodeInternal, err)"),
-		line("}"),
-		blank(),
-		linef("return connect.NewResponse(&%s{%s: entities}), nil", m.OutputType, listField),
-	)
+	return Concat(CodeMonoid, []Code{
+		Blank(),
+		Linef("func (s *%sServer) %s(ctx context.Context, req *connect.Request[%s]) (*connect.Response[%s], error) {",
+			svcName, m.GoName, inputType, outputType),
+		Indent(Concat(CodeMonoid, []Code{
+			limitCode,
+			Blank(),
+			Linef("entities, err := s.repos.%s.List(ctx, limit)", m.Entity.RepoField),
+			Line("if err != nil {"),
+			Line("	return nil, connect.NewError(connect.CodeInternal, err)"),
+			Line("}"),
+			Blank(),
+			Linef("return connect.NewResponse(&%s.%s{%s: entities}), nil", baseAlias, m.OutputType, m.ListField),
+		})),
+		Line("}"),
+	})
 }
 
-func genDelete(m MethodInfo) Code {
-	e := lowerFirst(m.Entity)
-	return concat(
-		linef("id := req.Msg.Get%s()", m.Config.IDGoName),
-		line(`if id == "" {`),
-		line(`	return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("id is required"))`),
-		line(`}`),
-		blank(),
-		linef("if err := s.%sRepo.Delete(ctx, id); err != nil {", e),
-		line("	if errors.Is(err, ErrNotFound) {"),
-		line("		return nil, connect.NewError(connect.CodeNotFound, err)"),
-		line("	}"),
-		line("	return nil, connect.NewError(connect.CodeInternal, err)"),
-		line("}"),
-		blank(),
-		line("return connect.NewResponse(&emptypb.Empty{}), nil"),
-	)
+func GenDelete(svcName string, m *MethodInfo, baseAlias string) Code {
+	inputType := baseAlias + "." + m.InputType
+
+	return Concat(CodeMonoid, []Code{
+		Blank(),
+		Linef("func (s *%sServer) %s(ctx context.Context, req *connect.Request[%s]) (*connect.Response[emptypb.Empty], error) {",
+			svcName, m.GoName, inputType),
+		Indent(Concat(CodeMonoid, []Code{
+			Linef("id := req.Msg.Get%s()", m.IDFieldName),
+			Line(`if id == "" {`),
+			Line(`	return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("id required"))`),
+			Line(`}`),
+			Blank(),
+			Linef("if err := s.repos.%s.Delete(ctx, id); err != nil {", m.Entity.RepoField),
+			Linef("	if errors.Is(err, %s.ErrNotFound) {", baseAlias),
+			Line("		return nil, connect.NewError(connect.CodeNotFound, err)"),
+			Line("	}"),
+			Line("	return nil, connect.NewError(connect.CodeInternal, err)"),
+			Line("}"),
+			Blank(),
+			Line("return connect.NewResponse(&emptypb.Empty{}), nil"),
+		})),
+		Line("}"),
+	})
 }
 
-func genMethod(svcName string, m MethodInfo) Code {
-	recv := fmt.Sprintf("s *%sServer", svcName)
-	params := fmt.Sprintf("ctx context.Context, req *connect.Request[%s]", m.InputType)
-	returns := fmt.Sprintf("(*connect.Response[%s], error)", m.OutputType)
-
-	var body Code
-	switch m.Op {
-	case "get":
-		body = genGet(m)
-	case "list":
-		body = genList(m)
-	case "delete":
-		body = genDelete(m)
+func GenMethod(svcName string, m *MethodInfo, baseAlias string) Code {
+	switch m.Pattern {
+	case PatternGet:
+		return GenGet(svcName, m, baseAlias)
+	case PatternList:
+		return GenList(svcName, m, baseAlias)
+	case PatternDelete:
+		return GenDelete(svcName, m, baseAlias)
+	default:
+		return CodeMonoid.Empty()
 	}
-
-	return concat(
-		blank(),
-		linef("func (%s) %s(%s) %s {", recv, m.GoName, params, returns),
-		indent(body),
-		line("}"),
-	)
 }
 
-func genService(svcName string, methods []MethodInfo) Code {
-	// Collect entities
-	entities := make(map[string]bool)
-	for _, m := range methods {
-		entities[m.Entity] = true
-	}
+// =============================================================================
+// SERVICE GENERATION
+// =============================================================================
 
-	// Struct fields
-	fields := empty
-	for e := range entities {
-		fields = append2(fields, linef("%sRepo *Firestore%sRepository", lowerFirst(e), e))
-	}
-
-	// Constructor params and assigns
-	var params []string
-	assigns := empty
-	for e := range entities {
-		params = append(params, fmt.Sprintf("%sRepo *Firestore%sRepository", lowerFirst(e), e))
-		assigns = append2(assigns, linef("	%sRepo: %sRepo,", lowerFirst(e), lowerFirst(e)))
-	}
-
-	// Methods
-	methodsCode := empty
-	for _, m := range methods {
-		methodsCode = append2(methodsCode, genMethod(svcName, m))
-	}
-
-	return concat(
-		blank(),
-		linef("type %sServer struct {", svcName),
-		indent(fields),
-		line("}"),
-		blank(),
-		linef("func New%sServer(%s) *%sServer {", svcName, strings.Join(params, ", "), svcName),
-		linef("	return &%sServer{", svcName),
-		assigns,
-		line("	}"),
-		line("}"),
-		methodsCode,
-	)
+type ServiceInfo struct {
+	GoName  string
+	Methods []*MethodInfo
 }
 
-func genFile(file *protogen.File, services map[string][]MethodInfo) Code {
-	svcCode := empty
-	for svcName, methods := range services {
-		svcCode = append2(svcCode, genService(svcName, methods))
+func GenService(svc ServiceInfo, connectAlias string, baseAlias string) Code {
+	methods := FoldMap(svc.Methods, CodeMonoid, func(m *MethodInfo) Code {
+		return GenMethod(svc.GoName, m, baseAlias)
+	})
+
+	return Concat(CodeMonoid, []Code{
+		Blank(),
+		Comment(fmt.Sprintf("%sServer implements %s", svc.GoName, svc.GoName)),
+		Linef("type %sServer struct {", svc.GoName),
+		Linef("	%s.Unimplemented%sHandler", connectAlias, svc.GoName),
+		Linef("	repos *%s.Repositories", baseAlias),
+		Line("}"),
+		Blank(),
+		Linef("func New%sServer(repos *%s.Repositories) *%sServer {", svc.GoName, baseAlias, svc.GoName),
+		Linef("	return &%sServer{repos: repos}", svc.GoName),
+		Line("}"),
+		methods,
+	})
+}
+
+func GenServiceSet(services []ServiceInfo) Code {
+	if len(services) == 0 {
+		return CodeMonoid.Empty()
 	}
 
-	return concat(
-		comment("Code generated by protoc-gen-connect-server. DO NOT EDIT."),
-		blank(),
-		linef("package %s", file.GoPackageName),
-		blank(),
-		line("import ("),
-		line(`	"context"`),
-		line(`	"errors"`),
-		blank(),
-		line(`	"connectrpc.com/connect"`),
-		line(`	"google.golang.org/protobuf/types/known/emptypb"`),
-		line(")"),
+	providers := FoldMap(services, CodeMonoid, func(svc ServiceInfo) Code {
+		return Linef("	New%sServer,", svc.GoName)
+	})
+
+	return Concat(CodeMonoid, []Code{
+		Blank(),
+		Comment("ServiceServerSet provides all generated service servers for Wire."),
+		Line("var ServiceServerSet = wire.NewSet("),
+		providers,
+		Line(")"),
+	})
+}
+
+func GenFile(pkgName string, services []ServiceInfo, connectPkg string, basePkg string) Code {
+	// Extract package alias from connect path
+	connectParts := strings.Split(connectPkg, "/")
+	connectAlias := connectParts[len(connectParts)-1]
+
+	// Use fixed alias for base package
+	baseAlias := "pb"
+
+	svcCode := FoldMap(services, CodeMonoid, func(svc ServiceInfo) Code {
+		return GenService(svc, connectAlias, baseAlias)
+	})
+
+	return Concat(CodeMonoid, []Code{
+		Comment("Code generated by protoc-gen-connect-server. DO NOT EDIT."),
+		Comment("Pattern-based generation using proto reflection."),
+		Blank(),
+		Linef("package %s", pkgName),
+		Blank(),
+		Line("import ("),
+		Line(`	"context"`),
+		Line(`	"errors"`),
+		Blank(),
+		Line(`	"connectrpc.com/connect"`),
+		Line(`	"github.com/google/wire"`),
+		Line(`	"google.golang.org/protobuf/types/known/emptypb"`),
+		Linef(`	%s "%s"`, baseAlias, basePkg),
+		Linef(`	"%s"`, connectPkg),
+		Line(")"),
+		Blank(),
+		Comment("Ensure imports"),
+		Line("var ("),
+		Line("	_ = wire.NewSet"),
+		Line("	_ = emptypb.Empty{}"),
+		Line("	_ = errors.New"),
+		Line("	_ = connect.CodeOK"),
+		Line(")"),
 		svcCode,
-	)
+		GenServiceSet(services),
+	})
 }
+
+// =============================================================================
+// MAIN - Pure functional pipeline
+// =============================================================================
 
 func main() {
 	protogen.Options{}.Run(func(gen *protogen.Plugin) error {
@@ -381,46 +527,58 @@ func main() {
 				continue
 			}
 
-			// Get entities
-			entities := make(map[string]*EntityConfig)
+			// Step 1: Extract entities (messages with entity option)
+			entities := make(map[string]*EntityInfo)
 			for _, msg := range f.Messages {
-				if cfg := getEntityConfig(msg); cfg != nil {
-					entities[msg.GoIdent.GoName] = cfg
+				if hasEntityOption(msg) {
+					info := ExtractEntityInfo(msg)
+					entities[info.GoName] = &info
 				}
 			}
+
 			if len(entities) == 0 {
 				continue
 			}
 
-			// Get service methods
-			services := make(map[string][]MethodInfo)
+			// Step 2: Analyze services - detect patterns by type signature
+			var services []ServiceInfo
 			for _, svc := range f.Services {
-				methods := extractMethods(svc, entities, f)
+				methods := Filter(
+					Map(svc.Methods, func(m *protogen.Method) *MethodInfo {
+						return DetectPattern(m, entities)
+					}),
+					func(m *MethodInfo) bool { return m != nil },
+				)
+
 				if len(methods) > 0 {
-					services[svc.GoName] = methods
+					services = append(services, ServiceInfo{
+						GoName:  svc.GoName,
+						Methods: methods,
+					})
 				}
 			}
+
 			if len(services) == 0 {
 				continue
 			}
 
-			g := gen.NewGeneratedFile(f.GeneratedFilenamePrefix+"_connect_server.pb.go", f.GoImportPath)
-			g.P(genFile(f, services).Run())
+			// Compute packages
+			basePkg := string(f.GoImportPath)
+			connectPkg := basePkg + "/" + strings.ToLower(string(f.GoPackageName)) + "connect"
+			serversPkgName := "servers"
+			serversPkgPath := basePkg + "/" + serversPkgName
+
+			// Step 3: Generate code into servers subpackage
+			// f.GeneratedFilenamePrefix is like "path/to/pkg" - we want "path/to/servers/servers.pb.go"
+			parts := strings.Split(f.GeneratedFilenamePrefix, "/")
+			if len(parts) > 0 {
+				parts[len(parts)-1] = "servers"
+			}
+			outputPath := strings.Join(parts, "/") + "/servers.pb.go"
+
+			g := gen.NewGeneratedFile(outputPath, protogen.GoImportPath(serversPkgPath))
+			g.P(GenFile(serversPkgName, services, connectPkg, basePkg).Run())
 		}
 		return nil
 	})
-}
-
-func lowerFirst(s string) string {
-	if len(s) == 0 {
-		return s
-	}
-	return strings.ToLower(s[:1]) + s[1:]
-}
-
-func fixEmptyType(t string) string {
-	if t == "Empty" {
-		return "emptypb.Empty"
-	}
-	return t
 }

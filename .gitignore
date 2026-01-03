@@ -17,3 +17,4 @@ vcs.xml
 .idea/copilot.data.migration.edit.xml
 .idea/modules.xml
 .idea/vcs.xml
+.env

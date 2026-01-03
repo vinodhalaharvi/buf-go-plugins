@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package category;
+
+option go_package = "github.com/example/protoc-gen-category/proto/category;category";
+
+import "google/protobuf/descriptor.proto";
+
+// File-level options
+extend google.protobuf.FileOptions {
+    CategoryFileOptions category_file = 50000;
+}
+
+message CategoryFileOptions {
+    // Effect types to generate infrastructure for
+    repeated EffectKind effects = 1;
+    // Stripe configuration (enables Stripe code generation)
+    StripeConfig stripe = 10;
+}
+
+// Stripe configuration
+message StripeConfig {
+    repeated string plans = 1;          // Plan names: ["free", "pro", "enterprise"]
+    string webhook_secret_env = 2;      // Env var for webhook secret (default: STRIPE_WEBHOOK_SECRET)
+    string api_key_env = 3;             // Env var for API key (default: STRIPE_SECRET_KEY)
+}
+
+enum EffectKind {
+    NETWORK = 0;
+    DATABASE = 1;
+    DISK = 2;
+}
+
+enum CombineStrategy {
+    INFER = 0;      // Infer from field types
+    CONCAT = 1;     // For strings, bytes, repeated fields
+    SUM = 2;        // For numeric types (addition)
+    PRODUCT = 3;    // For numeric types (multiplication)
+    ALL = 4;        // For bools (&&)
+    ANY = 5;        // For bools (||)
+    FIRST = 6;      // Take first non-zero value
+    LAST = 7;       // Take last non-zero value
+    MERGE = 8;      // Deep merge for nested messages
+}
+
+// Message-level options
+extend google.protobuf.MessageOptions {
+    CategoryMessageOptions category = 50001;
+}
+
+message CategoryMessageOptions {
+    bool functor = 1;       // Generate Functor (FMap for slices)
+    bool monoid = 2;        // Generate Monoid (Empty + Combine)
+    bool semigroup = 3;     // Generate Semigroup (Combine only)
+    bool foldable = 4;      // Generate Fold operations
+    bool traversable = 5;   // Generate Traverse for effects
+    bool monad = 6;         // Generate Bind for effects
+    bool bifunctor = 7;     // Generate Bimap (for 2-param types)
+
+    CombineStrategy combine = 8;  // Override combine strategy
+    
+    bool firestore_bridge = 10;   // Generate Firestore adapters
+    bool global = 11;             // Skip tenant scoping (for cross-tenant data)
+    
+    bool stripe_customer = 20;      // Generate Stripe customer operations
+    bool stripe_subscription = 21;  // Generate Stripe subscription operations
+}
+
+// Field-level options
+extend google.protobuf.FieldOptions {
+    FieldCategoryOptions field_category = 50002;
+}
+
+message FieldCategoryOptions {
+    CombineStrategy combine = 1;
+    string empty = 2;  // Custom empty value expression
+}
+
+// Service-level options
+extend google.protobuf.ServiceOptions {
+    CategoryServiceOptions category_service = 50003;
+}
+
+message CategoryServiceOptions {
+    bool kleisli = 1;           // Generate Kleisli arrow composition
+    bool middleware = 2;        // Generate typed middleware
+    bool parallel = 3;          // Generate parallel execution helpers
+    bool retry = 4;             // Generate retry logic
+    bool circuit_breaker = 5;   // Generate circuit breaker
+    bool fanout = 6;            // Generate fanout with monoid combine
+    bool mock = 7;              // Generate mock implementations
+    bool connect_bridge = 8;    // Generate Connect-go adapters
+    bool stripe_billing = 10;   // Generate billing/plan check interceptors
+}
+
+// Method-level options
+extend google.protobuf.MethodOptions {
+    CategoryMethodOptions category_method = 50004;
+}
+
+message CategoryMethodOptions {
+    bool idempotent = 1;    // Safe to retry
+    string fallback = 2;    // Fallback method name
+    string cache_key = 3;   // Cache key expression for memoization
+    
+    // Stripe billing options
+    string min_plan = 10;   // Minimum plan required (e.g., "pro", "enterprise")
+    bool metered = 11;      // Track usage for this method
+    string meter_event = 12; // Usage event name (default: method name)
+}
